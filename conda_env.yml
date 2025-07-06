@@ -1,0 +1,35 @@
+name: drq_diayn # Updated environment name
+channels:
+  - defaults
+  - pytorch # Added pytorch channel for pytorch dependency
+dependencies:
+  - python=3.7 # Consider updating Python version if compatible with all packages
+  - pip
+  - pytorch # Ensure this matches a valid pytorch version for your CUDA
+  - cudatoolkit # Ensure this matches the PyTorch CUDA version
+  - absl-py
+  - pyparsing
+  - jupyterlab
+  - scikit-image
+  - pandas
+  - ipdb
+  - tqdm
+  - torchvision # Ensure this matches PyTorch version
+  - yapf
+  - mujoco_py # Requires MuJoCo binaries
+  - scikit-learn # sklearn is usually scikit-learn
+  - matplotlib
+  - kornia
+  - pip:
+    - termcolor
+    - git+git://github.com/deepmind/dm_control.git # Consider replacing with a fixed version if issues arise
+    - git+git://github.com/denisyarats/dmc2gym.git # Consider replacing with a fixed version
+    - tensorboard # tb-nightly might be unstable, using stable tensorboard
+    - imageio
+    - imageio-ffmpeg
+    # - git+git://github.com/facebookresearch/hydra@0.11_branch # Removed Hydra
+    - opencv-python # Added OpenCV for video text overlay
+    # Note: some packages like pytorch, torchvision, cudatoolkit are often better managed directly by conda
+    # in the 'dependencies' section rather than pip, if specific versions are needed for compatibility.
+    # The current structure lists them under conda dependencies.
+```
