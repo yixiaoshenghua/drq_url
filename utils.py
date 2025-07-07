@@ -14,6 +14,8 @@ import gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Normal
+from torch.distributions.independent import Independent
 from skimage.util.shape import view_as_windows
 from torch import distributions as pyd
 from dowel import Histogram
@@ -42,7 +44,7 @@ def get_metric_prefix():
     if 'phase' in _g_context:
         prefix += _g_context['phase'].capitalize()
     if 'policy' in _g_context:
-        prefix += {'sampling': 'Sp', 'option': 'Op'}.get(
+        prefix += {'sampling': 'Sp', 'skill': 'Op'}.get(
             _g_context['policy'].lower(), _g_context['policy'].lower()).capitalize()
 
     if len(prefix) == 0:
@@ -205,8 +207,12 @@ def log_performance_ex(itr, batch, discount, additional_records=None, additional
         discounted_returns=[rtn[0] for rtn in returns],
     )
 
-def get_torch_concat_obs(obs, option, dim=1):
-    concat_obs = torch.cat([obs] + [option], dim=dim)
+def get_torch_concat_obs(obs, skill, dim=1):
+    concat_obs = torch.cat([obs] + [skill], dim=dim)
+    return concat_obs
+
+def get_np_concat_obs(obs, option):
+    concat_obs = np.concatenate([obs] + [option])
     return concat_obs
 
 def soft_update_params(net, target_net, tau):
@@ -248,46 +254,46 @@ def draw_2d_gaussians(means, stddevs, colors, ax, fill=False, alpha=0.8, use_ada
     else:
         ax.axis(plot_axis)
 
-def get_option_colors(options, color_range=4):
-    num_options = options.shape[0]
-    dim_option = options.shape[1]
+def get_skill_colors(skills, color_range=4):
+    num_skills = skills.shape[0]
+    dim_skill = skills.shape[1]
 
-    if dim_option <= 2:
-        # Use a predefined option color scheme
-        if dim_option == 1:
-            options_2d = []
+    if dim_skill <= 2:
+        # Use a predefined skill color scheme
+        if dim_skill == 1:
+            skills_2d = []
             d = 2.
-            for i in range(len(options)):
-                option = options[i][0]
-                if option < 0:
-                    abs_value = -option
-                    options_2d.append((d - abs_value * d, d))
+            for i in range(len(skills)):
+                skill = skills[i][0]
+                if skill < 0:
+                    abs_value = -skill
+                    skills_2d.append((d - abs_value * d, d))
                 else:
-                    abs_value = option
-                    options_2d.append((d, d - abs_value * d))
-            options = np.array(options_2d)
-        option_colors = get_2d_colors(options, (-color_range, -color_range), (color_range, color_range))
+                    abs_value = skill
+                    skills_2d.append((d, d - abs_value * d))
+            skills = np.array(skills_2d)
+        skill_colors = get_2d_colors(skills, (-color_range, -color_range), (color_range, color_range))
     else:
-        if dim_option > 3 and num_options >= 3:
+        if dim_skill > 3 and num_skills >= 3:
             pca = decomposition.PCA(n_components=3)
             # Add random noises to break symmetry.
-            pca_options = np.vstack((options, np.random.randn(dim_option, dim_option)))
-            pca.fit(pca_options)
-            option_colors = np.array(pca.transform(options))
-        elif dim_option > 3 and num_options < 3:
-            option_colors = options[:, :3]
-        elif dim_option == 3:
-            option_colors = options
+            pca_skills = np.vstack((skills, np.random.randn(dim_skill, dim_skill)))
+            pca.fit(pca_skills)
+            skill_colors = np.array(pca.transform(skills))
+        elif dim_skill > 3 and num_skills < 3:
+            skill_colors = skills[:, :3]
+        elif dim_skill == 3:
+            skill_colors = skills
 
         max_colors = np.array([color_range] * 3)
         min_colors = np.array([-color_range] * 3)
         if all((max_colors - min_colors) > 0):
-            option_colors = (option_colors - min_colors) / (max_colors - min_colors)
-        option_colors = np.clip(option_colors, 0, 1)
+            skill_colors = (skill_colors - min_colors) / (max_colors - min_colors)
+        skill_colors = np.clip(skill_colors, 0, 1)
 
-        option_colors = np.c_[option_colors, np.full(len(option_colors), 0.8)]
+        skill_colors = np.c_[skill_colors, np.full(len(skill_colors), 0.8)]
 
-    return option_colors
+    return skill_colors
 
 def get_2d_colors(points, min_point, max_point):
     points = np.array(points)
@@ -304,14 +310,20 @@ def get_2d_colors(points, min_point, max_point):
 
     return colors
 
-
 def set_seed_everywhere(seed):
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
     random.seed(seed)
-
+    np.random.seed(seed)
+    if 'torch' in sys.modules:
+        import warnings
+        warnings.warn(
+            'Enabeling deterministic mode in PyTorch can have a performance '
+            'impact when using GPU.')
+        import torch  # pylint: disable=import-outside-toplevel
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
 def make_dir(*path_parts):
     dir_path = os.path.join(*path_parts)
@@ -511,7 +523,272 @@ class SquashedNormal(pyd.transformed_distribution.TransformedDistribution):
         for tr in self.transforms:
             mu = tr(mu)
         return mu
-    
+
+
+"""A Gaussian distribution with tanh transformation."""
+
+class TanhNormal(torch.distributions.Distribution):
+    r"""A distribution induced by applying a tanh transformation to a Gaussian random variable.
+
+    Algorithms like SAC and Pearl use this transformed distribution.
+    It can be thought of as a distribution of X where
+        :math:`Y ~ \mathcal{N}(\mu, \sigma)`
+        :math:`X = tanh(Y)`
+
+    Args:
+        loc (torch.Tensor): The mean of this distribution.
+        scale (torch.Tensor): The stdev of this distribution.
+
+    """ # noqa: 501
+
+    def __init__(self, loc, scale):
+        self._normal = Independent(Normal(loc, scale), 1)
+        super().__init__(batch_shape=self._normal.batch_shape,
+                         event_shape=self._normal.event_shape,
+                         validate_args=False)
+
+    def log_prob(self, value, pre_tanh_value=None, epsilon=1e-6):
+        """The log likelihood of a sample on the this Tanh Distribution.
+
+        Args:
+            value (torch.Tensor): The sample whose loglikelihood is being
+                computed.
+            pre_tanh_value (torch.Tensor): The value prior to having the tanh
+                function applied to it but after it has been sampled from the
+                normal distribution.
+            epsilon (float): Regularization constant. Making this value larger
+                makes the computation more stable but less precise.
+
+        Note:
+              when pre_tanh_value is None, an estimate is made of what the
+              value is. This leads to a worse estimation of the log_prob.
+              If the value being used is collected from functions like
+              `sample` and `rsample`, one can instead use functions like
+              `sample_return_pre_tanh_value` or
+              `rsample_return_pre_tanh_value`
+
+
+        Returns:
+            torch.Tensor: The log likelihood of value on the distribution.
+
+        """
+        # pylint: disable=arguments-differ
+        if pre_tanh_value is None:
+            # Fix in order to TanhNormal.log_prob(1.0) != inf
+            pre_tanh_value = torch.log((1 + epsilon + value) / (1 + epsilon - value)) / 2
+        norm_lp = self._normal.log_prob(pre_tanh_value)
+        ret = (norm_lp - torch.sum(
+            torch.log(self._clip_but_pass_gradient((1. - value**2)) + epsilon),
+            axis=-1))
+        return ret
+
+    def sample(self, sample_shape=torch.Size()):
+        """Return a sample, sampled from this TanhNormal Distribution.
+
+        Args:
+            sample_shape (list): Shape of the returned value.
+
+        Note:
+            Gradients `do not` pass through this operation.
+
+        Returns:
+            torch.Tensor: Sample from this TanhNormal distribution.
+
+        """
+        with torch.no_grad():
+            return self.rsample(sample_shape=sample_shape)
+
+    def rsample(self, sample_shape=torch.Size()):
+        """Return a sample, sampled from this TanhNormal Distribution.
+
+        Args:
+            sample_shape (list): Shape of the returned value.
+
+        Note:
+            Gradients pass through this operation.
+
+        Returns:
+            torch.Tensor: Sample from this TanhNormal distribution.
+
+        """
+        z = self._normal.rsample(sample_shape)
+        return torch.tanh(z)
+
+    def rsample_with_pre_tanh_value(self, sample_shape=torch.Size()):
+        """Return a sample, sampled from this TanhNormal distribution.
+
+        Returns the sampled value before the tanh transform is applied and the
+        sampled value with the tanh transform applied to it.
+
+        Args:
+            sample_shape (list): shape of the return.
+
+        Note:
+            Gradients pass through this operation.
+
+        Returns:
+            torch.Tensor: Samples from this distribution.
+            torch.Tensor: Samples from the underlying
+                :obj:`torch.distributions.Normal` distribution, prior to being
+                transformed with `tanh`.
+
+        """
+        z = self._normal.rsample(sample_shape)
+        return z, torch.tanh(z)
+
+    def cdf(self, value):
+        """Returns the CDF at the value.
+
+        Returns the cumulative density/mass function evaluated at
+        `value` on the underlying normal distribution.
+
+        Args:
+            value (torch.Tensor): The element where the cdf is being evaluated
+                at.
+
+        Returns:
+            torch.Tensor: the result of the cdf being computed.
+
+        """
+        return self._normal.cdf(value)
+
+    def icdf(self, value):
+        """Returns the icdf function evaluated at `value`.
+
+        Returns the icdf function evaluated at `value` on the underlying
+        normal distribution.
+
+        Args:
+            value (torch.Tensor): The element where the cdf is being evaluated
+                at.
+
+        Returns:
+            torch.Tensor: the result of the cdf being computed.
+
+        """
+        return self._normal.icdf(value)
+
+    @classmethod
+    def _from_distribution(cls, new_normal):
+        """Construct a new TanhNormal distribution from a normal distribution.
+
+        Args:
+            new_normal (Independent(Normal)): underlying normal dist for
+                the new TanhNormal distribution.
+
+        Returns:
+            TanhNormal: A new distribution whose underlying normal dist
+                is new_normal.
+
+        """
+        # pylint: disable=protected-access
+        new = cls(torch.zeros(1), torch.zeros(1))
+        new._normal = new_normal
+        return new
+
+    def expand(self, batch_shape, _instance=None):
+        """Returns a new TanhNormal distribution.
+
+        (or populates an existing instance provided by a derived class) with
+        batch dimensions expanded to `batch_shape`. This method calls
+        :class:`~torch.Tensor.expand` on the distribution's parameters. As
+        such, this does not allocate new memory for the expanded distribution
+        instance. Additionally, this does not repeat any args checking or
+        parameter broadcasting in `__init__.py`, when an instance is first
+        created.
+
+        Args:
+            batch_shape (torch.Size): the desired expanded size.
+            _instance(instance): new instance provided by subclasses that
+                need to override `.expand`.
+
+        Returns:
+            Instance: New distribution instance with batch dimensions expanded
+            to `batch_size`.
+
+        """
+        new_normal = self._normal.expand(batch_shape, _instance)
+        new = self._from_distribution(new_normal)
+        return new
+
+    def enumerate_support(self, expand=True):
+        """Returns tensor containing all values supported by a discrete dist.
+
+        The result will enumerate over dimension 0, so the shape
+        of the result will be `(cardinality,) + batch_shape + event_shape`
+        (where `event_shape = ()` for univariate distributions).
+
+        Note that this enumerates over all batched tensors in lock-step
+        `[[0, 0], [1, 1], ...]`. With `expand=False`, enumeration happens
+        along dim 0, but with the remaining batch dimensions being
+        singleton dimensions, `[[0], [1], ..`.
+
+        To iterate over the full Cartesian product use
+        `itertools.product(m.enumerate_support())`.
+
+        Args:
+            expand (bool): whether to expand the support over the
+                batch dims to match the distribution's `batch_shape`.
+
+        Note:
+            Calls the enumerate_support function of the underlying normal
+            distribution.
+
+        Returns:
+            torch.Tensor: Tensor iterating over dimension 0.
+
+        """
+        return self._normal.enumerate_support(expand)
+
+    @property
+    def mean(self):
+        """torch.Tensor: mean of the distribution."""
+        return torch.tanh(self._normal.mean)
+
+    @property
+    def variance(self):
+        """torch.Tensor: variance of the underlying normal distribution."""
+        return self._normal.variance
+
+    def entropy(self):
+        """Returns entropy of the underlying normal distribution.
+
+        Returns:
+            torch.Tensor: entropy of the underlying normal distribution.
+
+        """
+        return self._normal.entropy()
+
+    @staticmethod
+    def _clip_but_pass_gradient(x, lower=0., upper=1.):
+        """Clipping function that allows for gradients to flow through.
+
+        Args:
+            x (torch.Tensor): value to be clipped
+            lower (float): lower bound of clipping
+            upper (float): upper bound of clipping
+
+        Returns:
+            torch.Tensor: x clipped between lower and upper.
+
+        """
+        clip_up = (x > upper).float()
+        clip_low = (x < lower).float()
+        with torch.no_grad():
+            clip = ((upper - x) * clip_up + (lower - x) * clip_low)
+        return x + clip
+
+    def __repr__(self):
+        """Returns the parameterization of the distribution.
+
+        Returns:
+            str: The parameterization of the distribution and underlying
+                distribution.
+
+        """
+        return self.__class__.__name__
+
+
 """Utiliy functions for tensors."""
 import numpy as np
 import scipy.signal
@@ -898,3 +1175,145 @@ def sliding_window(t, window, smear=False):
         t_win = pad_tensor(t_win, t.shape[0], mode='last')
 
     return t_win
+
+
+from math import inf
+from torch.nn.init import _calculate_fan_in_and_fan_out, _no_grad_normal_
+from torch.distributions import Beta, Normal, TransformedDistribution
+from torch.distributions.transforms import AffineTransform, _InverseTransform
+
+class ParameterModule(nn.Module):
+    def __init__(
+            self,
+            init_value
+    ):
+        super().__init__()
+
+        self.param = torch.nn.Parameter(init_value)
+
+class NoWeakrefTrait(object):
+    def _inv_no_weakref(self):
+        """
+        Returns the inverse :class:`Transform` of this transform.
+        This should satisfy ``t.inv.inv is t``.
+        """
+        inv = None
+        if self._inv is not None:
+            #inv = self._inv()
+            inv = self._inv
+        if inv is None:
+            inv = _InverseTransform(self)
+            #inv = _InverseTransformNoWeakref(self)
+            #self._inv = weakref.ref(inv)
+            self._inv = inv
+        return inv
+
+class AffineTransformEx(AffineTransform, NoWeakrefTrait):
+    @property
+    def inv(self):
+        return NoWeakrefTrait._inv_no_weakref(self)
+
+    def maybe_clone_to_device(self, device):
+        if device == self.loc.device:
+            return self
+        return AffineTransformEx(loc=self.loc.to(device, copy=True),
+                                 scale=self.scale.to(device, copy=True))
+class TransformedDistributionEx(TransformedDistribution):
+    def entropy(self):
+        """
+        Returns entropy of distribution, batched over batch_shape.
+
+        Returns:
+            Tensor of shape batch_shape.
+        """
+        ent = self.base_dist.entropy()
+        for t in self.transforms:
+            if isinstance(t, AffineTransform):
+                affine_ent = torch.log(torch.abs(t.scale))
+                if t.event_dim > 0:
+                    sum_dims = list(range(-t.event_dim, 0))
+                    affine_ent = affine_ent.sum(dim=sum_dims)
+                ent = ent + affine_ent
+            else:
+                raise NotImplementedError
+        return ent
+
+def unsqueeze_expand_flat_dim0(x, num):
+    return x.unsqueeze(dim=0).expand(num, *((-1,) * x.ndim)).reshape(
+            num * x.size(0), *x.size()[1:])
+
+def _get_transform_summary(transform):
+    if isinstance(transform, AffineTransform):
+        return f'{type(transform).__name__}({transform.loc}, {transform.scale})'
+    raise NotImplementedError
+
+def wrap_dist_with_transforms(base_dist_cls, transforms):
+    def _create(*args, **kwargs):
+        return TransformedDistributionEx(base_dist_cls(*args, **kwargs),
+                                         transforms)
+    _create.__name__ = (f'{base_dist_cls.__name__}['
+                        + ', '.join(_get_transform_summary(t) for t in transforms) + ']')
+    return _create
+
+def unwrap_dist(dist):
+    while hasattr(dist, 'base_dist'):
+        dist = dist.base_dist
+    return dist
+
+def get_outermost_dist_attr(dist, attr):
+    while (not hasattr(dist, attr)) and hasattr(dist, 'base_dist'):
+        dist = dist.base_dist
+    return getattr(dist, attr, None)
+
+def get_affine_transform_for_beta_dist(target_min, target_max):
+    # https://stackoverflow.com/a/12569453/2182622
+    if isinstance(target_min, (np.ndarray, np.generic)):
+        assert np.all(target_min <= target_max)
+    else:
+        assert target_min <= target_max
+    #return AffineTransform(loc=torch.Tensor(target_min),
+    #                       scale=torch.Tensor(target_max - target_min))
+    return AffineTransformEx(loc=torch.tensor(target_min),
+                             scale=torch.tensor(target_max - target_min))
+
+def compute_total_norm(parameters, norm_type=2):
+    # Code adopted from clip_grad_norm_().
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    norm_type = float(norm_type)
+    if len(parameters) == 0:
+        return torch.tensor(0.)
+    device = parameters[0].grad.device
+    if norm_type == inf:
+        total_norm = max(p.grad.detach().abs().max().to(device) for p in parameters)
+    else:
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
+    return total_norm
+
+class TrainContext:
+    def __init__(self, modules):
+        self.modules = modules
+
+    def __enter__(self):
+        for m in self.modules:
+            m.train()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        for m in self.modules:
+            m.eval()
+
+def xavier_normal_ex(tensor, gain=1., multiplier=0.1):
+    fan_in, fan_out = _calculate_fan_in_and_fan_out(tensor)
+    std = gain * math.sqrt(2.0 / float(fan_in + fan_out))
+    return _no_grad_normal_(tensor, 0., std * multiplier)
+
+def kaiming_uniform_ex_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu', gain=None):
+    fan = torch.nn.init._calculate_correct_fan(tensor, mode)
+    gain = gain or torch.nn.init.calculate_gain(nonlinearity, a)
+    std = gain / math.sqrt(fan)
+    bound = math.sqrt(3.0) * std  # Calculate uniform bounds from standard deviation
+    with torch.no_grad():
+        return tensor.uniform_(-bound, bound)
+

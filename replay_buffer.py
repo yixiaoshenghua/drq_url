@@ -1,13 +1,21 @@
 import numpy as np
-from gym.spaces.box import Box
-from gym.spaces.discrete import Discrete
-from gym.spaces.dict import Dict
+import functools
+import gym
+from gym.spaces import Discrete, Dict
 import kornia
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import utils
 import collections
+from collections import defaultdict
+
+class Box(gym.spaces.Box):
+    """A Box space with a custom `flat_dim` property."""
+    @property
+    def flat_dim(self):
+        """Return the flattened dimension of the box."""
+        return int(np.prod(self.shape))
 
 class ReplayBuffer(object):
     """Buffer to store environment transitions."""
@@ -714,5 +722,151 @@ class TrajectoryBatch(
                    lengths=lengths)
 
 
-def obtain_exact_trajectories(): # TODO:
-    pass
+class SkillRolloutWorker:
+    def __init__(
+            self,
+            seed,
+            max_path_length,
+            cur_extra_keys,
+    ):
+        self._observations = []
+        self._last_observations = []
+        self._actions = []
+        self._rewards = []
+        self._terminals = []
+        self._lengths = []
+        self._agent_infos = defaultdict(list)
+        self._env_infos = defaultdict(list)
+        self._prev_obs = None
+        self._path_length = 0
+        self._max_path_length_override = None
+        self._cur_extra_keys = cur_extra_keys
+        self._render = False
+        self._deterministic_policy = None
+        self._seed = seed
+        self._max_path_length = max_path_length
+        self.worker_init()
+
+    def worker_init(self):
+        """Initialize a worker."""
+        if self._seed is not None:
+            utils.set_seed_everywhere(self._seed)
+
+    def get_attrs(self, keys):
+        attr_dict = {}
+        for key in keys:
+            attr_dict[key] = functools.reduce(getattr, [self] + key.split('.'))
+        return attr_dict
+
+    def start_rollout(self, env, policy, deterministic_policy=False):
+        """Begin a new rollout."""
+
+        while hasattr(env, 'env'):
+            env = getattr(env, 'env')
+
+        self._path_length = 0
+        timestep = env.reset()
+        self._prev_obs = timestep["image"]
+        self._prev_extra = None
+
+        policy.reset()
+        policy._force_use_mode_actions = deterministic_policy
+
+    def step_rollout(self, env, policy, extra=None):
+        """Take a single time-step in the current rollout.
+
+        Returns:
+            bool: True iff the path is done, either due to the environment
+            indicating termination of due to reaching `max_path_length`.
+
+        """
+        cur_max_path_length = self._max_path_length if self._max_path_length_override is None else self._max_path_length_override
+        if self._path_length < cur_max_path_length:
+            if 'skill' in self._cur_extra_keys:
+                cur_extra_key = 'skill'
+            else:
+                cur_extra_key = None
+
+            if cur_extra_key is None:
+                agent_input = self._prev_obs
+            else:
+                cur_extra = extra[cur_extra_key]
+
+                agent_input = utils.get_np_concat_obs(
+                    self._prev_obs, cur_extra,
+                )
+                self._prev_extra = cur_extra
+
+            a, agent_info = policy.get_action(agent_input)
+
+            timestep = env.step({"action": a})
+
+            self._observations.append(self._prev_obs)
+            self._rewards.append(timestep['reward'])
+            self._actions.append(a)
+
+            for k, v in agent_info.items():
+                self._agent_infos[k].append(v)
+            for k in self._cur_extra_keys:
+                self._agent_infos[k].append(extra[k])
+
+            for k, v in timestep['info'].items():
+                self._env_infos[k].append(v)
+            self._path_length += 1
+            self._terminals.append(timestep['is_terminal'])
+            if not timestep['is_terminal']:
+                self._prev_obs = timestep["image"]
+                return False
+        self._terminals[-1] = True
+        self._lengths.append(self._path_length)
+        self._last_observations.append(self._prev_obs)
+        return True
+
+    def collect_rollout(self):
+        """Collect the current rollout, clearing the internal buffer.
+
+        Returns:
+            garage.TrajectoryBatch: A batch of the trajectories completed since
+                the last call to collect_rollout().
+
+        """
+        observations = self._observations
+        self._observations = []
+        last_observations = self._last_observations
+        self._last_observations = []
+        actions = self._actions
+        self._actions = []
+        rewards = self._rewards
+        self._rewards = []
+        terminals = self._terminals
+        self._terminals = []
+        env_infos = self._env_infos
+        self._env_infos = defaultdict(list)
+        agent_infos = self._agent_infos
+        self._agent_infos = defaultdict(list)
+        for k, v in agent_infos.items():
+            agent_infos[k] = np.asarray(v)
+        for k, v in env_infos.items():
+            env_infos[k] = np.asarray(v)
+        lengths = self._lengths
+        self._lengths = []
+        return TrajectoryBatch(self.env.spec, np.asarray(observations),
+                               np.asarray(last_observations),
+                               np.asarray(actions), np.asarray(rewards),
+                               np.asarray(terminals), dict(env_infos),
+                               dict(agent_infos), np.asarray(lengths,
+                                                             dtype='i'))
+
+    def rollout(self, env, policy, extra=None, deterministic_policy=False):
+        """Sample a single rollout of the agent in the environment.
+        Params:
+            extra: {'skill': skill}
+        Returns:
+            garage.TrajectoryBatch: The collected trajectory.
+
+        """
+        self.start_rollout(env, policy, deterministic_policy=deterministic_policy)
+        while not self.step_rollout(env, policy, extra):
+            pass
+        return self.collect_rollout()
+

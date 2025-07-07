@@ -7,11 +7,13 @@ import copy
 import math
 import time
 import utils
-from dowel import Histogram
-from replay_buffer import TrajectoryBatch, obtain_exact_trajectories
+from dowel import Histogram, logger
+from replay_buffer import TrajectoryBatch, SkillRolloutWorker
 import sac_utils
 from collections import defaultdict
 import tqdm
+import functools
+from networks import PolicyEx, ContinuousMLPQFunctionEx, GaussianMLPIndependentStdModuleEx, GaussianMLPTwoHeadedModuleEx, Encoder, WithEncoder
 
 class DictBatchDataset:
     """Use when the input is the dict type."""
@@ -99,7 +101,6 @@ class OptimizerGroupWrapper:
             for pg in self._optimizers[key].param_groups:
                 for p in pg['params']:
                     yield p
-
 class MeasureAndAccTime:
     def __init__(self, target):
         assert isinstance(target, list)
@@ -128,8 +129,18 @@ def compute_total_norm(parameters, norm_type=2):
         total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
     return total_norm
 
+def _finalize_lr(lr, common_lr=1e-4):
+    if lr is None:
+        lr = common_lr
+    else:
+        assert bool(lr), 'To specify a lr of 0, use a negative value'
+    if lr < 0.0:
+        logger.log(f'Setting lr to ZERO given {lr}')
+        lr = 0.0
+    return lr
 
-class DRQ_METRAAgent(object):
+
+class DRQ_METRAAgent:
     """
     DrQ agent with METRA skill discovery integration.
     Manages the actor, critic, and their updates.
@@ -137,9 +148,6 @@ class DRQ_METRAAgent(object):
     """
     def __init__(self,
             env,
-            qf1,
-            qf2,
-            log_alpha,
             tau,
             scale_reward,
             target_coef,
@@ -148,6 +156,7 @@ class DRQ_METRAAgent(object):
             inner,
             num_alt_samples,
             split_group,
+            dual_lam,
             dual_reg,
             dual_slack,
             dual_dist,
@@ -155,12 +164,8 @@ class DRQ_METRAAgent(object):
             env_name,
             algo,
             env_spec,
-            option_policy,
-            traj_encoder,
             skill_dynamics,
             dist_predictor,
-            dual_lam,
-            optimizer,
             alpha,
             max_path_length,
             n_epochs_per_eval,
@@ -169,7 +174,7 @@ class DRQ_METRAAgent(object):
             n_epochs_per_save,
             n_epochs_per_pt_save,
             n_epochs_per_pkl_update,
-            dim_option,
+            dim_skill,
             num_random_trajectories,
             num_video_repeats,
             eval_record_video,
@@ -188,10 +193,22 @@ class DRQ_METRAAgent(object):
             unit_length=False,
             batch_size=32,
             snapshot_dir=None,
+            use_encoder=True,
+            spectral_normalization=False,
+            model_master_nonlinearity=None,
+            model_master_dim=1024,
+            model_master_num_layers=2,
+            lr_op=None,
+            lr_te=None,
+            dual_lr=None,
+            sac_lr_q=None,
+            sac_lr_a=None,
+            seed=0,
     ):
         self._env = env
         self.env_name = env_name
         self.algo = algo
+        self.seed = seed
 
         self.step_itr = 0
         self.snapshot_dir = snapshot_dir
@@ -201,12 +218,89 @@ class DRQ_METRAAgent(object):
 
         self.device = device
         self.sample_cpu = sample_cpu
-        self.option_policy = option_policy.to(self.device)
+        # skill_policy
+        if model_master_nonlinearity == 'relu':
+            nonlinearity = torch.relu
+        elif model_master_nonlinearity == 'tanh':
+            nonlinearity = torch.tanh
+        else:
+            nonlinearity = None
+        self.use_encoder = use_encoder
+        example_ob = env.reset()
+        if self.use_encoder: # for pixels input
+            def make_encoder(**kwargs):
+                return Encoder(pixel_shape=pixel_shape, **kwargs)
+
+            def with_encoder(module, encoder=None):
+                if encoder is None:
+                    encoder = make_encoder()
+
+                return WithEncoder(encoder=encoder, module=module)
+
+            example_encoder = make_encoder()
+            module_obs_dim = example_encoder(torch.as_tensor(example_ob).float().unsqueeze(0)).shape[-1]
+        policy_q_input_dim = module_obs_dim + dim_skill
+        action_dim = self._env.spec.action_space.flat_dim
+        master_dims = [model_master_dim] * model_master_num_layers
+        self.skill_policy = PolicyEx(
+            name='skill_policy',
+            module=with_encoder(GaussianMLPTwoHeadedModuleEx(
+                input_dim=policy_q_input_dim,
+                output_dim=action_dim,
+                hidden_sizes=master_dims,
+                hidden_nonlinearity=nonlinearity,
+                layer_normalization=False,
+                max_std=np.exp(2.),
+                normal_distribution_cls=utils.TanhNormal,
+                output_w_init=functools.partial(utils.xavier_normal_ex, gain=1.),
+                init_std=1.,
+            )) if self.use_encoder else GaussianMLPTwoHeadedModuleEx(
+                input_dim=policy_q_input_dim,
+                output_dim=action_dim,
+                hidden_sizes=master_dims,
+                hidden_nonlinearity=nonlinearity,
+                layer_normalization=False,
+                max_std=np.exp(2.),
+                normal_distribution_cls=utils.TanhNormal,
+                output_w_init=functools.partial(utils.xavier_normal_ex, gain=1.),
+                init_std=1.,
+            ),
+            skill_info={'dim_skill': dim_skill}
+        ).to(self.device)
+        # traj_encoder
+        self.spectral_normalization = spectral_normalization
+        traj_encoder_obs_dim = module_obs_dim
+        traj_encoder = GaussianMLPIndependentStdModuleEx(
+            input_dim=traj_encoder_obs_dim,
+            output_dim=dim_skill,
+            std_hidden_sizes=master_dims,
+            std_hidden_nonlinearity=nonlinearity or torch.relu,
+            std_hidden_w_init=torch.nn.init.xavier_uniform_,
+            std_output_w_init=torch.nn.init.xavier_uniform_,
+            init_std=1.0,
+            min_std=1e-6,
+            max_std=None,
+            hidden_sizes=master_dims,
+            hidden_nonlinearity=nonlinearity or torch.relu,
+            hidden_w_init=torch.nn.init.xavier_uniform_,
+            output_w_init=torch.nn.init.xavier_uniform_,
+            std_parameterization='exp',
+            bias=True,
+            spectral_normalization=self.spectral_normalization,
+        )
+        if self.use_encoder:
+            if self.spectral_normalization:
+                te_encoder = make_encoder(spectral_normalization=True)
+            else:
+                te_encoder = None
+            traj_encoder = with_encoder(traj_encoder, encoder=te_encoder)
         self.traj_encoder = traj_encoder.to(self.device)
-        self.dual_lam = dual_lam.to(self.device)
+        # dual_lambda
+        self.dual_lam = utils.ParameterModule(torch.Tensor([np.log(dual_lam)])).to(self.device)
+        
         self.param_modules = {
             'traj_encoder': self.traj_encoder,
-            'option_policy': self.option_policy,
+            'skill_policy': self.skill_policy,
             'dual_lam': self.dual_lam,
         }
         if skill_dynamics is not None:
@@ -216,10 +310,34 @@ class DRQ_METRAAgent(object):
             self.dist_predictor = dist_predictor.to(self.device)
             self.param_modules['dist_predictor'] = self.dist_predictor
 
+        optimizers = {
+            'option_policy': torch.optim.Adam([
+                {'params': self.skill_policy.parameters(), 'lr': _finalize_lr(lr_op)},
+            ]),
+            'traj_encoder': torch.optim.Adam([
+                {'params': self.traj_encoder.parameters(), 'lr': _finalize_lr(lr_te)},
+            ]),
+            'dual_lam': torch.optim.Adam([
+                {'params': self.dual_lam.parameters(), 'lr': _finalize_lr(dual_lr)},
+            ]),
+        }
+        if skill_dynamics is not None:
+            optimizers.update({
+                'skill_dynamics': torch.optim.Adam([
+                    {'params': skill_dynamics.parameters(), 'lr': _finalize_lr(lr_te)},
+                ]),
+            })
+        if dist_predictor is not None:
+            optimizers.update({
+                'dist_predictor': torch.optim.Adam([
+                    {'params': dist_predictor.parameters(), 'lr': _finalize_lr(lr_op)},
+                ]),
+            })
+
         self.alpha = alpha
         self.name = name
 
-        self.dim_option = dim_option
+        self.dim_skill = dim_skill
 
         self._num_train_per_epoch = num_train_per_epoch
         self._env_spec = env_spec
@@ -235,9 +353,6 @@ class DRQ_METRAAgent(object):
         self.eval_record_video = eval_record_video
         self.video_skip_frames = video_skip_frames
         self.eval_plot_axis = eval_plot_axis
-
-        assert isinstance(optimizer, OptimizerGroupWrapper)
-        self._optimizer = optimizer
 
         self._sd_batch_norm = sd_batch_norm
         self._skill_dynamics_obs_dim = skill_dynamics_obs_dim
@@ -257,18 +372,49 @@ class DRQ_METRAAgent(object):
 
         self.traj_encoder.eval()
 
+        qf1 = ContinuousMLPQFunctionEx(
+            obs_dim=policy_q_input_dim,
+            action_dim=action_dim,
+            hidden_sizes=master_dims,
+            hidden_nonlinearity=nonlinearity or torch.relu,
+            )
+        if self.use_encoder:
+            qf1 = with_encoder(qf1)
+        qf2 = ContinuousMLPQFunctionEx(
+            obs_dim=policy_q_input_dim,
+            action_dim=action_dim,
+            hidden_sizes=master_dims,
+            hidden_nonlinearity=nonlinearity or torch.relu,
+        )
+        if self.use_encoder:
+            qf2 = with_encoder(qf2)
         self.qf1 = qf1.to(self.device)
         self.qf2 = qf2.to(self.device)
 
         self.target_qf1 = copy.deepcopy(self.qf1)
         self.target_qf2 = copy.deepcopy(self.qf2)
 
+        log_alpha = utils.ParameterModule(torch.Tensor([np.log(self.alpha)]))
         self.log_alpha = log_alpha.to(self.device)
 
         self.param_modules.update(
             qf1=self.qf1,
             qf2=self.qf2,
             log_alpha=self.log_alpha,
+        )
+
+        optimizers.update({
+            'qf': torch.optim.Adam([
+                {'params': list(qf1.parameters()) + list(qf2.parameters()), 'lr': _finalize_lr(sac_lr_q)},
+            ]),
+            'log_alpha': torch.optim.Adam([
+                {'params': log_alpha.parameters(), 'lr': _finalize_lr(sac_lr_a)},
+            ])
+        })
+
+        self._optimizer = OptimizerGroupWrapper(
+            optimizers=optimizers,
+            max_optimization_epochs=None,
         )
 
         self.tau = tau
@@ -294,10 +440,12 @@ class DRQ_METRAAgent(object):
         self._start_time = time.time()
         self.total_env_steps = 0
 
+        self.rollout_worker = SkillRolloutWorker(self.seed, max_path_length=self.max_path_length, cur_extra_keys=['skill'])
+
     @property
     def policy(self):
         return {
-            'option_policy': self.option_policy,
+            'skill_policy': self.skill_policy,
         }
 
     def all_parameters(self):
@@ -305,28 +453,124 @@ class DRQ_METRAAgent(object):
             for p in m.parameters():
                 yield p
 
-    def _get_concat_obs(self, obs, option):
-        return utils.get_torch_concat_obs(obs, option)
+
+    #########################################################################################################
+    #                                                                                                       #
+    #                                        interacting with env                                           #
+    #                                                                                                       #
+    #########################################################################################################
+    def _generate_skill_extras(self, skills):
+        return [{'skill': skill} for skill in skills]
 
     def _get_train_trajectories_kwargs(self):
         if self.discrete: # False
-            extras = self._generate_option_extras(np.eye(self.dim_option)[np.random.randint(0, self.dim_option, self.batch_size)])
+            extras = self._generate_skill_extras(np.eye(self.dim_skill)[np.random.randint(0, self.dim_skill, self.batch_size)])
         else:
-            random_options = np.random.randn(self.batch_size, self.dim_option)
+            random_skills = np.random.randn(self.batch_size, self.dim_skill)
             if self.unit_length:
-                random_options /= np.linalg.norm(random_options, axis=-1, keepdims=True)
-            extras = self._generate_option_extras(random_options)
+                random_skills /= np.linalg.norm(random_skills, axis=-1, keepdims=True)
+            extras = self._generate_skill_extras(random_skills)
 
         return dict(
             extras=extras,
-            sampler_key='option_policy',
         )
+
+    def _get_train_trajectories(self):
+        default_kwargs = dict(
+            batch_size=self.batch_size,
+            deterministic_policy=False,
+        )
+        kwargs = dict(default_kwargs, **self._get_train_trajectories_kwargs())
+
+        paths = self._get_trajectories(**kwargs)
+
+        return paths
+
+    def _get_trajectories(self,
+                          batch_size=None,
+                          deterministic_policy=False,
+                          extras=None):
+        if batch_size is None:
+            batch_size = len(extras)
+        time_get_trajectories = [0.0]
+        with MeasureAndAccTime(time_get_trajectories):
+            trajectories = self.obtain_exact_trajectories( 
+                env=self._env,
+                policy=self.skill_policy,
+                batch_size=batch_size,
+                extras=extras,
+                deterministic_policy=deterministic_policy,
+            )
+        print(f'_get_trajectories {time_get_trajectories[0]}s')
+
+        for traj in trajectories:
+            for key in ['ori_obs', 'next_ori_obs', 'coordinates', 'next_coordinates']:
+                if key not in traj['env_infos']:
+                    continue
+
+        return trajectories
+
+    def obtain_exact_trajectories(self, env, policy, batch_size, extras, deterministic_policy=False): 
+        batches = []
+        for i in range(batch_size):
+            extra = extras[i]
+            batch = self.rollout_worker.rollout(env, policy, extra, deterministic_policy=deterministic_policy)
+            batches.append(batch)
+        return TrajectoryBatch.concatenate(*batches)
+
+    #########################################################################################################
+    #                                                                                                       #
+    #                                        processing data                                                #
+    #                                                                                                       #
+    #########################################################################################################
+    def _get_mini_tensors(self, epoch_data):
+        num_transitions = len(epoch_data['actions'])
+        idxs = np.random.choice(num_transitions, self._trans_minibatch_size)
+
+        data = {}
+        for key, value in epoch_data.items():
+            data[key] = value[idxs]
+
+        return data
+
+    def _get_concat_obs(self, obs, skill):
+        return utils.get_torch_concat_obs(obs, skill)
 
     def _flatten_data(self, data):
         epoch_data = {}
         for key, value in data.items():
             epoch_data[key] = torch.tensor(np.concatenate(value, axis=0), dtype=torch.float32, device=self.device)
         return epoch_data
+
+    def _get_policy_param_values(self, key):
+        param_dict = self.policy[key].get_param_values()
+        for k in param_dict.keys():
+            if self.sample_cpu:
+                param_dict[k] = param_dict[k].detach().cpu()
+            else:
+                param_dict[k] = param_dict[k].detach()
+        return param_dict
+
+    def process_samples(self, paths):
+        data = defaultdict(list)
+        for path in paths:
+            data['obs'].append(path['observations'])
+            data['next_obs'].append(path['next_observations'])
+            data['actions'].append(path['actions'])
+            data['rewards'].append(path['rewards'])
+            data['dones'].append(path['dones'])
+            data['returns'].append(utils.discount_cumsum(path['rewards'], self.discount))
+            data['ori_obs'].append(path['env_infos']['ori_obs'])
+            data['next_ori_obs'].append(path['env_infos']['next_ori_obs'])
+            if 'pre_tanh_value' in path['agent_infos']:
+                data['pre_tanh_values'].append(path['agent_infos']['pre_tanh_value'])
+            if 'log_prob' in path['agent_infos']:
+                data['log_probs'].append(path['agent_infos']['log_prob'])
+            if 'skill' in path['agent_infos']:
+                data['skills'].append(path['agent_infos']['skill'])
+                data['next_skills'].append(np.concatenate([path['agent_infos']['skill'][1:], path['agent_infos']['skill'][-1:]], axis=0))
+
+        return data
 
     def _update_replay_buffer(self, data):
         if self.replay_buffer is not None:
@@ -344,11 +588,16 @@ class DRQ_METRAAgent(object):
         samples = self.replay_buffer.sample_transitions(self._trans_minibatch_size)
         data = {}
         for key, value in samples.items():
-            if value.shape[1] == 1 and 'option' not in key:
+            if value.shape[1] == 1 and 'skill' not in key:
                 value = np.squeeze(value, axis=1)
             data[key] = torch.from_numpy(value).float().to(self.device)
         return data
     
+    #########################################################################################################
+    #                                                                                                       #
+    #                                               training                                                #
+    #                                                                                                       #
+    #########################################################################################################
     def train(self, n_epochs):
         last_return = None
         self.total_epoch = 0
@@ -377,8 +626,7 @@ class DRQ_METRAAgent(object):
                     time_sampling = [0.0]
                     with MeasureAndAccTime(time_sampling):
                         step_path = self._get_train_trajectories()
-                    # TODO: increment the total_env_steps
-                    self.total_env_steps += ...
+                    self.total_env_steps += step_path.lengths.sum()
                     last_return = self.train_once(
                         self.step_itr,
                         step_path,
@@ -467,9 +715,9 @@ class DRQ_METRAAgent(object):
         for _ in range(self._trans_optimization_epochs):
             tensors = {}
 
-            if self.replay_buffer is None:
+            if self.replay_buffer is None: # on policy training
                 v = self._get_mini_tensors(epoch_data)
-            else:
+            else: # off policy training
                 v = self._sample_replay_buffer()
 
             self._optimize_te(tensors, v)
@@ -514,7 +762,7 @@ class DRQ_METRAAgent(object):
         self._update_loss_op(tensors, internal_vars)
         self._gradient_descent(
             tensors['LossSacp'],
-            optimizer_keys=['option_policy'],
+            optimizer_keys=['skill_policy'],
         )
 
         self._update_loss_alpha(tensors, internal_vars)
@@ -535,10 +783,10 @@ class DRQ_METRAAgent(object):
             target_z = next_z - cur_z
 
             if self.discrete:
-                masks = (v['options'] - v['options'].mean(dim=1, keepdim=True)) * self.dim_option / (self.dim_option - 1 if self.dim_option != 1 else 1)
+                masks = (v['skills'] - v['skills'].mean(dim=1, keepdim=True)) * self.dim_skill / (self.dim_skill - 1 if self.dim_skill != 1 else 1)
                 rewards = (target_z * masks).sum(dim=1)
             else:
-                inner = (target_z * v['options']).sum(dim=1)
+                inner = (target_z * v['skills']).sum(dim=1)
                 rewards = inner
 
             # For dual objectives
@@ -551,9 +799,9 @@ class DRQ_METRAAgent(object):
 
             if self.discrete:
                 logits = target_dists.mean
-                rewards = -torch.nn.functional.cross_entropy(logits, v['options'].argmax(dim=1), reduction='none')
+                rewards = -torch.nn.functional.cross_entropy(logits, v['skills'].argmax(dim=1), reduction='none')
             else:
-                rewards = target_dists.log_prob(v['options'])
+                rewards = target_dists.log_prob(v['skills'])
 
         tensors.update({
             'PureRewardMean': rewards.mean(),
@@ -634,8 +882,8 @@ class DRQ_METRAAgent(object):
         })
 
     def _update_loss_qf(self, tensors, v):
-        processed_cat_obs = self._get_concat_obs(v['obs'], v['options'])
-        next_processed_cat_obs = self._get_concat_obs(v['next_obs'], v['next_options'])
+        processed_cat_obs = self._get_concat_obs(self.skill_policy.process_observations(v['obs']), v['skills'])
+        next_processed_cat_obs = self._get_concat_obs(self.skill_policy.process_observations(v['next_obs']), v['next_skills'])
 
         sac_utils.update_loss_qf(
             self, tensors, v,
@@ -644,7 +892,7 @@ class DRQ_METRAAgent(object):
             next_obs=next_processed_cat_obs,
             dones=v['dones'],
             rewards=v['rewards'] * self._reward_scale_factor,
-            policy=self.option_policy,
+            policy=self.skill_policy,
         )
 
         v.update({
@@ -653,11 +901,11 @@ class DRQ_METRAAgent(object):
         })
 
     def _update_loss_op(self, tensors, v):
-        processed_cat_obs = self._get_concat_obs(v['obs'], v['options'])
+        processed_cat_obs = self._get_concat_obs(self.skill_policy.process_observations(v['obs']), v['skills'])
         sac_utils.update_loss_sacp(
             self, tensors, v,
             obs=processed_cat_obs,
-            policy=self.option_policy,
+            policy=self.skill_policy,
         )
 
     def _update_loss_alpha(self, tensors, v):
@@ -665,104 +913,96 @@ class DRQ_METRAAgent(object):
             self, tensors, v,
         )
 
-    def _get_mini_tensors(self, epoch_data):
-        num_transitions = len(epoch_data['actions'])
-        idxs = np.random.choice(num_transitions, self._trans_minibatch_size)
 
-        data = {}
-        for key, value in epoch_data.items():
-            data[key] = value[idxs]
-
-        return data
-
+    #########################################################################################################
+    #                                                                                                       #
+    #                                        logging and eval                                               #
+    #                                                                                                       #
+    #########################################################################################################
     def _evaluate_policy(self):
         if self.discrete:
-            eye_options = np.eye(self.dim_option)
-            random_options = []
+            eye_skills = np.eye(self.dim_skill)
+            random_skills = []
             colors = []
-            for i in range(self.dim_option):
-                num_trajs_per_option = self.num_random_trajectories // self.dim_option + (i < self.num_random_trajectories % self.dim_option)
-                for _ in range(num_trajs_per_option):
-                    random_options.append(eye_options[i])
+            for i in range(self.dim_skill):
+                num_trajs_per_skill = self.num_random_trajectories // self.dim_skill + (i < self.num_random_trajectories % self.dim_skill)
+                for _ in range(num_trajs_per_skill):
+                    random_skills.append(eye_skills[i])
                     colors.append(i)
-            random_options = np.array(random_options)
+            random_skills = np.array(random_skills)
             colors = np.array(colors)
-            num_evals = len(random_options)
+            num_evals = len(random_skills)
             from matplotlib import cm
-            cmap = 'tab10' if self.dim_option <= 10 else 'tab20'
-            random_option_colors = []
+            cmap = 'tab10' if self.dim_skill <= 10 else 'tab20'
+            random_skill_colors = []
             for i in range(num_evals):
-                random_option_colors.extend([cm.get_cmap(cmap)(colors[i])[:3]])
-            random_option_colors = np.array(random_option_colors)
+                random_skill_colors.extend([cm.get_cmap(cmap)(colors[i])[:3]])
+            random_skill_colors = np.array(random_skill_colors)
         else:
-            random_options = np.random.randn(self.num_random_trajectories, self.dim_option)
+            random_skills = np.random.randn(self.num_random_trajectories, self.dim_skill)
             if self.unit_length:
-                random_options = random_options / np.linalg.norm(random_options, axis=1, keepdims=True)
-            random_option_colors = utils.get_option_colors(random_options * 4)
+                random_skills = random_skills / np.linalg.norm(random_skills, axis=1, keepdims=True)
+            random_skill_colors = utils.get_skill_colors(random_skills * 4)
         random_trajectories = self._get_trajectories(
-            sampler_key='option_policy',
-            extras=self._generate_option_extras(random_options),
-            worker_update=dict(
-                _render=False,
-                _deterministic_policy=True,
-            ),
-            env_update=dict(_action_noise_std=None),
+            batch_size=self.num_random_trajectories,
+            extras=self._generate_skill_extras(random_skills),
+            deterministic_policy=True,
         )
 
         with utils.FigManager(self.snapshot_dir, self.step_itr, 'TrajPlot_RandomZ') as fm:
             self._env.render_trajectories( # TODO:
-                random_trajectories, random_option_colors, self.eval_plot_axis, fm.ax
+                random_trajectories, random_skill_colors, self.eval_plot_axis, fm.ax
             )
 
         data = self.process_samples(random_trajectories)
         last_obs = torch.stack([torch.from_numpy(ob[-1]).to(self.device) for ob in data['obs']])
-        option_dists = self.traj_encoder(last_obs)
+        skill_dists = self.traj_encoder(last_obs)
 
-        option_means = option_dists.mean.detach().cpu().numpy()
+        skill_means = skill_dists.mean.detach().cpu().numpy()
         if self.inner:
-            option_stddevs = torch.ones_like(option_dists.stddev.detach().cpu()).numpy()
+            skill_stddevs = torch.ones_like(skill_dists.stddev.detach().cpu()).numpy()
         else:
-            option_stddevs = option_dists.stddev.detach().cpu().numpy()
-        option_samples = option_dists.mean.detach().cpu().numpy()
+            skill_stddevs = skill_dists.stddev.detach().cpu().numpy()
+        skill_samples = skill_dists.mean.detach().cpu().numpy()
 
-        option_colors = random_option_colors
+        skill_colors = random_skill_colors
 
         with utils.FigManager(self.snapshot_dir, self.step_itr, f'PhiPlot') as fm:
-            utils.draw_2d_gaussians(option_means, option_stddevs, option_colors, fm.ax)
+            utils.draw_2d_gaussians(skill_means, skill_stddevs, skill_colors, fm.ax)
             utils.draw_2d_gaussians(
-                option_samples,
-                [[0.03, 0.03]] * len(option_samples),
-                option_colors,
+                skill_samples,
+                [[0.03, 0.03]] * len(skill_samples),
+                skill_colors,
                 fm.ax,
                 fill=True,
                 use_adaptive_axis=True,
             )
 
-        eval_option_metrics = {}
+        eval_skill_metrics = {}
 
         # Videos
         if self.eval_record_video:
             if self.discrete:
-                video_options = np.eye(self.dim_option)
-                video_options = video_options.repeat(self.num_video_repeats, axis=0)
+                video_skills = np.eye(self.dim_skill)
+                video_skills = video_skills.repeat(self.num_video_repeats, axis=0)
             else:
-                if self.dim_option == 2:
+                if self.dim_skill == 2:
                     radius = 1. if self.unit_length else 1.5
-                    video_options = []
+                    video_skills = []
                     for angle in [3, 2, 1, 4]:
-                        video_options.append([radius * np.cos(angle * np.pi / 4), radius * np.sin(angle * np.pi / 4)])
-                    video_options.append([0, 0])
+                        video_skills.append([radius * np.cos(angle * np.pi / 4), radius * np.sin(angle * np.pi / 4)])
+                    video_skills.append([0, 0])
                     for angle in [0, 5, 6, 7]:
-                        video_options.append([radius * np.cos(angle * np.pi / 4), radius * np.sin(angle * np.pi / 4)])
-                    video_options = np.array(video_options)
+                        video_skills.append([radius * np.cos(angle * np.pi / 4), radius * np.sin(angle * np.pi / 4)])
+                    video_skills = np.array(video_skills)
                 else:
-                    video_options = np.random.randn(9, self.dim_option)
+                    video_skills = np.random.randn(9, self.dim_skill)
                     if self.unit_length:
-                        video_options = video_options / np.linalg.norm(video_options, axis=1, keepdims=True)
-                video_options = video_options.repeat(self.num_video_repeats, axis=0)
+                        video_skills = video_skills / np.linalg.norm(video_skills, axis=1, keepdims=True)
+                video_skills = video_skills.repeat(self.num_video_repeats, axis=0)
             video_trajectories = self._get_trajectories(
-                sampler_key='local_option_policy',
-                extras=self._generate_option_extras(video_options),
+                sampler_key='local_skill_policy',
+                extras=self._generate_skill_extras(video_skills),
                 worker_update=dict(
                     _render=True,
                     _deterministic_policy=True,
@@ -770,100 +1010,20 @@ class DRQ_METRAAgent(object):
             )
             utils.record_video(self.snapshot_dir, self.step_itr, 'Video_RandomZ', video_trajectories, skip_frames=self.video_skip_frames)
 
-        eval_option_metrics.update(self._env.calc_eval_metrics(random_trajectories, is_option_trajectories=True)) # TODO:
-        with utils.GlobalContext({'phase': 'eval', 'policy': 'option'}):
+        eval_skill_metrics.update(self._env.calc_eval_metrics(random_trajectories, is_skill_trajectories=True)) # TODO:
+        with utils.GlobalContext({'phase': 'eval', 'policy': 'skill'}):
             utils.log_performance_ex(
                 self.step_itr,
                 TrajectoryBatch.from_trajectory_list(self._env_spec, random_trajectories),
                 discount=self.discount,
-                additional_records=eval_option_metrics,
+                additional_records=eval_skill_metrics,
             )
         self._log_eval_metrics()
 
-    def _generate_option_extras(self, options):
-        return [{'option': option} for option in options]
-
-    def _get_train_trajectories(self):
-        default_kwargs = dict(
-            update_stats=True,
-            worker_update=dict(
-                _render=False,
-                _deterministic_policy=False,
-            ),
-            env_update=dict(_action_noise_std=None),
-        )
-        kwargs = dict(default_kwargs, **self._get_train_trajectories_kwargs())
-
-        paths = self._get_trajectories(**kwargs)
-
-        return paths
-
-    def _get_trajectories(self,
-                          sampler_key,
-                          batch_size=None,
-                          extras=None,
-                          update_stats=False,
-                          worker_update=None,
-                          env_update=None):
-        if batch_size is None:
-            batch_size = len(extras)
-        policy_sampler_key = sampler_key[6:] if sampler_key.startswith('local_') else sampler_key
-        time_get_trajectories = [0.0]
-        with MeasureAndAccTime(time_get_trajectories):
-            trajectories, infos = obtain_exact_trajectories( # TODO:
-                self.step_itr,
-                sampler_key=sampler_key,
-                batch_size=batch_size,
-                agent_update=self._get_policy_param_values(policy_sampler_key),
-                env_update=env_update,
-                worker_update=worker_update,
-                extras=extras,
-                update_stats=update_stats,
-            )
-        print(f'_get_trajectories({sampler_key}) {time_get_trajectories[0]}s')
-
-        for traj in trajectories:
-            for key in ['ori_obs', 'next_ori_obs', 'coordinates', 'next_coordinates']:
-                if key not in traj['env_infos']:
-                    continue
-
-        return trajectories
-
-    def _get_policy_param_values(self, key):
-        param_dict = self.policy[key].get_param_values()
-        for k in param_dict.keys():
-            if self.sample_cpu:
-                param_dict[k] = param_dict[k].detach().cpu()
-            else:
-                param_dict[k] = param_dict[k].detach()
-        return param_dict
-
-
+    
     def _log_eval_metrics(self):
         self.eval_log_diagnostics()
         self.plot_log_diagnostics()
-
-    def process_samples(self, paths):
-        data = defaultdict(list)
-        for path in paths:
-            data['obs'].append(path['observations'])
-            data['next_obs'].append(path['next_observations'])
-            data['actions'].append(path['actions'])
-            data['rewards'].append(path['rewards'])
-            data['dones'].append(path['dones'])
-            data['returns'].append(utils.discount_cumsum(path['rewards'], self.discount))
-            data['ori_obs'].append(path['env_infos']['ori_obs'])
-            data['next_ori_obs'].append(path['env_infos']['next_ori_obs'])
-            if 'pre_tanh_value' in path['agent_infos']:
-                data['pre_tanh_values'].append(path['agent_infos']['pre_tanh_value'])
-            if 'log_prob' in path['agent_infos']:
-                data['log_probs'].append(path['agent_infos']['log_prob'])
-            if 'option' in path['agent_infos']:
-                data['options'].append(path['agent_infos']['option'])
-                data['next_options'].append(np.concatenate([path['agent_infos']['option'][1:], path['agent_infos']['option'][-1:]], axis=0))
-
-        return data
-
 
     def eval_log_diagnostics(self):
         total_time = (time.time() - self._start_time)
