@@ -1,550 +1,882 @@
 import numpy as np
+from math import inf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
 import math
-
+import time
 import utils
+from dowel import Histogram
+from replay_buffer import TrajectoryBatch, obtain_exact_trajectories
+import sac_utils
+from collections import defaultdict
+import tqdm
 
-class Encoder(nn.Module):
-    """
-    Convolutional encoder for image-based observations.
-    Takes an observation and outputs a flat feature vector.
-    """
-    def __init__(self, obs_shape, feature_dim):
-        super().__init__()
+class DictBatchDataset:
+    """Use when the input is the dict type."""
+    def __init__(self, inputs, batch_size):
+        self._inputs = inputs
+        self._batch_size = batch_size
+        self._size = list(self._inputs.values())[0].shape[0]
+        if batch_size is not None:
+            self._ids = np.arange(self._size)
+            self.update()
 
-        assert len(obs_shape) == 3
-        self.num_layers = 4
-        self.num_filters = 32
-        self.output_dim = 25
-        self.output_logits = False
-        self.feature_dim = feature_dim
+    @property
+    def number_batches(self):
+        if self._batch_size is None:
+            return 1
+        return int(np.ceil(self._size * 1.0 / self._batch_size))
 
-        self.convs = nn.ModuleList([
-            nn.Conv2d(obs_shape[-1], self.num_filters, 3, stride=2),
-            nn.Conv2d(self.num_filters, self.num_filters, 3, stride=1),
-            nn.Conv2d(self.num_filters, self.num_filters, 3, stride=1),
-            nn.Conv2d(self.num_filters, self.num_filters, 3, stride=1)
-        ])
-
-        self.head = nn.Sequential(
-            nn.Linear(self.num_filters * self.output_dim * self.output_dim, self.feature_dim),
-            nn.LayerNorm(self.feature_dim))
-
-        self.outputs = dict()
-
-    def forward_conv(self, obs):
-        if obs.shape[-1] == 3 or obs.shape[-1] == 9:
-            obs = obs.permute(0, 3, 1, 2)
-        obs = obs / 255.
-        self.outputs['obs'] = obs
-
-        conv = torch.relu(self.convs[0](obs))
-        self.outputs['conv1'] = conv
-
-        for i in range(1, self.num_layers):
-            conv = torch.relu(self.convs[i](conv))
-            self.outputs['conv%s' % (i + 1)] = conv
-
-        h = conv.reshape((conv.size(0), -1))
-        return h
-
-    def forward(self, obs, detach=False):
-        h = self.forward_conv(obs)
-
-        if detach:
-            h = h.detach()
-
-        out = self.head(h)
-        if not self.output_logits:
-            out = torch.tanh(out)
-
-        self.outputs['out'] = out
-
-        return out
-
-    def copy_conv_weights_from(self, source):
-        """Tie convolutional layers"""
-        for i in range(self.num_layers):
-            utils.tie_weights(src=source.convs[i], trg=self.convs[i])
-
-    def log(self, logger, step):
-        for k, v in self.outputs.items():
-            logger.log_histogram(f'train_encoder/{k}_hist', v, step)
-            if len(v.shape) > 2:
-                logger.log_image(f'train_encoder/{k}_img', v[0], step)
-
-        for i in range(self.num_layers):
-            logger.log_param(f'train_encoder/conv{i + 1}', self.convs[i], step)
-
-
-class Actor(nn.Module):
-    """
-    Actor network (policy) for DrQ. Outputs a distribution over actions.
-    Can be skill-conditioned for DIAYN.
-    """
-    def __init__(self, obs_shape, feature_dim, action_shape, hidden_dim, hidden_depth,
-                 log_std_bounds, num_skills, skill_embedding_dim):
-        """
-        Args:
-            obs_shape (tuple): Shape of the observation space.
-            feature_dim (int): Dimension of the features from the encoder.
-            action_shape (tuple): Shape of the action space.
-            hidden_dim (int): Dimension of hidden layers in the MLP.
-            hidden_depth (int): Number of hidden layers in the MLP.
-            log_std_bounds (list/tuple): Min and max values for log_std.
-            num_skills (int): Number of skills for DIAYN. If 0, DIAYN is not used.
-            skill_embedding_dim (int): Dimension for skill embeddings if num_skills > 0.
-        """
-        super().__init__()
-
-        self.encoder = Encoder(obs_shape, feature_dim)
-        self.num_skills = num_skills
-        self.skill_embedding_dim = skill_embedding_dim
-
-        # Determine input dimension for the policy's MLP trunk
-        trunk_input_dim = self.encoder.feature_dim
-        if self.num_skills > 0:
-            self.skill_embedding = nn.Embedding(num_skills, skill_embedding_dim)
-            trunk_input_dim += skill_embedding_dim
-
-        self.log_std_bounds = log_std_bounds
-        # MLP trunk outputs parameters for the action distribution (mean and log_std)
-        self.trunk = utils.mlp(trunk_input_dim, hidden_dim,
-                               2 * action_shape[0], hidden_depth)
-
-        self.outputs = dict() # For logging intermediate activations
-        self.apply(utils.weight_init) # Apply weight initialization
-
-    def forward(self, obs, skill=None, detach_encoder=False):
-        """
-        Forward pass of the actor.
-        Args:
-            obs (torch.Tensor): Batch of observations.
-            skill (torch.Tensor, optional): Batch of skills, if DIAYN is used.
-            detach_encoder (bool): Whether to detach the encoder features from the graph.
-        Returns:
-            SquashedNormal distribution over actions.
-        """
-        obs_features = self.encoder(obs, detach=detach_encoder)
-
-        # If skill-conditioned, concatenate skill embedding with observation features
-        if self.num_skills > 0:
-            if skill is None:
-                raise ValueError("Skill must be provided when num_skills > 0 for DIAYN Actor.")
-            # skill shape expected: (batch_size, 1) or (batch_size,)
-            skill_emb = self.skill_embedding(skill.long().squeeze(-1)) # Squeeze to handle (B,1) -> (B)
-            combined_features = torch.cat([obs_features, skill_emb], dim=-1)
+    def iterate(self, update=True):
+        if self._batch_size is None:
+            yield self._inputs
         else:
-            combined_features = obs_features
+            if update:
+                self.update()
+            for itr in range(self.number_batches):
+                batch_start = itr * self._batch_size
+                batch_end = (itr + 1) * self._batch_size
+                batch_ids = self._ids[batch_start:batch_end]
+                batch = {
+                    k: v[batch_ids]
+                    for k, v in self._inputs.items()
+                }
+                yield batch
 
-        mu, log_std = self.trunk(combined_features).chunk(2, dim=-1)
+    def update(self):
+        np.random.shuffle(self._ids)
 
-        # constrain log_std inside [log_std_min, log_std_max]
-        log_std = torch.tanh(log_std)
-        log_std_min, log_std_max = self.log_std_bounds
-        log_std = log_std_min + 0.5 * (log_std_max - log_std_min) * (log_std +
-                                                                     1)
-        std = log_std.exp()
-
-        self.outputs['mu'] = mu
-        self.outputs['std'] = std
-
-        dist = utils.SquashedNormal(mu, std)
-        return dist
-
-    def log(self, logger, step):
-        for k, v in self.outputs.items():
-            logger.log_histogram(f'train_actor/{k}_hist', v, step)
-
-        for i, m in enumerate(self.trunk):
-            if type(m) == nn.Linear:
-                logger.log_param(f'train_actor/fc{i}', m, step)
-
-
-class Critic(nn.Module):
+class OptimizerGroupWrapper:
+    """A wrapper class to handle torch.optim.optimizer.
     """
-    Critic network for DrQ. Implements double Q-learning (two Q-functions).
-    It takes observations and actions to predict Q-values.
-    """
-    def __init__(self, obs_shape, feature_dim, action_shape, hidden_dim, hidden_depth):
+
+    def __init__(self,
+                 optimizers,
+                 max_optimization_epochs=1,
+                 minibatch_size=None):
+        self._optimizers = optimizers
+        self._max_optimization_epochs = max_optimization_epochs
+        self._minibatch_size = minibatch_size
+
+    def get_minibatch(self, data, max_optimization_epochs=None):
+        batch_dataset = DictBatchDataset(data, self._minibatch_size)
+
+        if max_optimization_epochs is None:
+            max_optimization_epochs = self._max_optimization_epochs
+
+        for _ in range(max_optimization_epochs):
+            for dataset in batch_dataset.iterate():
+                yield dataset
+
+    def zero_grad(self, keys=None):
+        r"""Clears the gradients of all optimized :class:`torch.Tensor` s."""
+
+        # optimize to param = None style.
+        if keys is None:
+            keys = self._optimizers.keys()
+        for key in keys:
+            self._optimizers[key].zero_grad()
+
+    def step(self, keys=None, **closure):
+        """Performs a single optimization step.
+
+        Arguments:
+            **closure (callable, optional): A closure that reevaluates the
+                model and returns the loss.
+
         """
-        Args:
-            obs_shape (tuple): Shape of the observation space.
-            feature_dim (int): Dimension of the features from the encoder.
-            action_shape (tuple): Shape of the action space.
-            hidden_dim (int): Dimension of hidden layers in the MLP.
-            hidden_depth (int): Number of hidden layers in the MLP.
-        """
-        super().__init__()
+        if keys is None:
+            keys = self._optimizers.keys()
+        for key in keys:
+            self._optimizers[key].step(**closure)
 
-        self.encoder = Encoder(obs_shape, feature_dim)
+    def target_parameters(self, keys=None):
+        if keys is None:
+            keys = self._optimizers.keys()
+        for key in keys:
+            for pg in self._optimizers[key].param_groups:
+                for p in pg['params']:
+                    yield p
 
-        # MLP for the first Q-function
-        self.Q1 = utils.mlp(self.encoder.feature_dim + action_shape[0], # Input: encoded_obs + action
-                            hidden_dim, 1, hidden_depth) # Output: Q-value
-        # MLP for the second Q-function (for double Q-learning)
-        self.Q2 = utils.mlp(self.encoder.feature_dim + action_shape[0],
-                            hidden_dim, 1, hidden_depth)
+class MeasureAndAccTime:
+    def __init__(self, target):
+        assert isinstance(target, list)
+        assert len(target) == 1
+        self._target = target
 
-        self.outputs = dict() # For logging
-        self.apply(utils.weight_init)
+    def __enter__(self):
+        self._time_enter = time.time()
+        return self
 
-    def forward(self, obs, action, detach_encoder=False):
-        """
-        Forward pass of the critic.
-        Args:
-            obs (torch.Tensor): Batch of observations.
-            action (torch.Tensor): Batch of actions.
-            detach_encoder (bool): Whether to detach the encoder features.
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Q1 and Q2 values.
-        """
-        assert obs.size(0) == action.size(0)
-        obs_features = self.encoder(obs, detach=detach_encoder)
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._target[0] += (time.time() - self._time_enter)
 
-        obs_action = torch.cat([obs_features, action], dim=-1) # Concatenate features and actions
-        q1 = self.Q1(obs_action)
-        q2 = self.Q2(obs_action)
-
-        self.outputs['q1'] = q1
-        self.outputs['q2'] = q2
-
-        return q1, q2
-
-    def log(self, logger, step):
-        self.encoder.log(logger, step)
-
-        for k, v in self.outputs.items():
-            logger.log_histogram(f'train_critic/{k}_hist', v, step)
-
-        assert len(self.Q1) == len(self.Q2)
-        for i, (m1, m2) in enumerate(zip(self.Q1, self.Q2)):
-            assert type(m1) == type(m2)
-            if type(m1) is nn.Linear:
-                logger.log_param(f'train_critic/q1_fc{i}', m1, step)
-                logger.log_param(f'train_critic/q2_fc{i}', m2, step)
+def compute_total_norm(parameters, norm_type=2):
+    # Code adopted from clip_grad_norm_().
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    norm_type = float(norm_type)
+    if len(parameters) == 0:
+        return torch.tensor(0.)
+    device = parameters[0].grad.device
+    if norm_type == inf:
+        total_norm = max(p.grad.detach().abs().max().to(device) for p in parameters)
+    else:
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
+    return total_norm
 
 
 class DRQ_METRAAgent(object):
     """
     DrQ agent with METRA skill discovery integration.
-    Manages the actor, critic, discriminator, and their updates.
+    Manages the actor, critic, and their updates.
     Configuration is now passed via explicit arguments (formerly Hydra).
     """
     def __init__(self,
-                 obs_shape, action_shape, action_range, device, # Core RL setup
-                 feature_dim, # Encoder specific
-                 critic_hidden_dim, critic_hidden_depth, # Critic specific
-                 actor_hidden_dim, actor_hidden_depth, actor_log_std_min, actor_log_std_max, # Actor specific
-                 num_skills, skill_embedding_dim, diayn_intrinsic_reward_coeff, # DIAYN specific
-                 discriminator_hidden_dim, discriminator_hidden_depth, # Discriminator specific
-                 discount, init_temperature, lr, lr_discriminator, # RL algorithm HPs & optimizers
-                 actor_update_frequency, critic_tau, critic_target_update_frequency, batch_size # Update rules
-                 ):
-        self.action_range = action_range
-        self.device = device
+            env,
+            qf1,
+            qf2,
+            log_alpha,
+            tau,
+            scale_reward,
+            target_coef,
+            replay_buffer,
+            min_buffer_size,
+            inner,
+            num_alt_samples,
+            split_group,
+            dual_reg,
+            dual_slack,
+            dual_dist,
+            pixel_shape,
+            env_name,
+            algo,
+            env_spec,
+            option_policy,
+            traj_encoder,
+            skill_dynamics,
+            dist_predictor,
+            dual_lam,
+            optimizer,
+            alpha,
+            max_path_length,
+            n_epochs_per_eval,
+            n_epochs_per_log,
+            n_epochs_per_tb,
+            n_epochs_per_save,
+            n_epochs_per_pt_save,
+            n_epochs_per_pkl_update,
+            dim_option,
+            num_random_trajectories,
+            num_video_repeats,
+            eval_record_video,
+            video_skip_frames,
+            eval_plot_axis,
+            name='IOD',
+            device=torch.device('cuda'),
+            sample_cpu=True,
+            num_train_per_epoch=1,
+            discount=0.99,
+            sd_batch_norm=False,
+            skill_dynamics_obs_dim=None,
+            trans_minibatch_size=None,
+            trans_optimization_epochs=None,
+            discrete=False,
+            unit_length=False,
+            batch_size=32,
+            snapshot_dir=None,
+    ):
+        self._env = env
+        self.env_name = env_name
+        self.algo = algo
+
+        self.step_itr = 0
+        self.snapshot_dir = snapshot_dir
+
         self.discount = discount
-        self.critic_tau = critic_tau # Soft update coefficient for target critic
-        self.actor_update_frequency = actor_update_frequency
-        self.critic_target_update_frequency = critic_target_update_frequency
+        self.max_path_length = max_path_length
+
+        self.device = device
+        self.sample_cpu = sample_cpu
+        self.option_policy = option_policy.to(self.device)
+        self.traj_encoder = traj_encoder.to(self.device)
+        self.dual_lam = dual_lam.to(self.device)
+        self.param_modules = {
+            'traj_encoder': self.traj_encoder,
+            'option_policy': self.option_policy,
+            'dual_lam': self.dual_lam,
+        }
+        if skill_dynamics is not None:
+            self.skill_dynamics = skill_dynamics.to(self.device)
+            self.param_modules['skill_dynamics'] = self.skill_dynamics
+        if dist_predictor is not None:
+            self.dist_predictor = dist_predictor.to(self.device)
+            self.param_modules['dist_predictor'] = self.dist_predictor
+
+        self.alpha = alpha
+        self.name = name
+
+        self.dim_option = dim_option
+
+        self._num_train_per_epoch = num_train_per_epoch
+        self._env_spec = env_spec
+
+        self.n_epochs_per_eval = n_epochs_per_eval
+        self.n_epochs_per_log = n_epochs_per_log
+        self.n_epochs_per_tb = n_epochs_per_tb
+        self.n_epochs_per_save = n_epochs_per_save
+        self.n_epochs_per_pt_save = n_epochs_per_pt_save
+        self.n_epochs_per_pkl_update = n_epochs_per_pkl_update
+        self.num_random_trajectories = num_random_trajectories
+        self.num_video_repeats = num_video_repeats
+        self.eval_record_video = eval_record_video
+        self.video_skip_frames = video_skip_frames
+        self.eval_plot_axis = eval_plot_axis
+
+        assert isinstance(optimizer, OptimizerGroupWrapper)
+        self._optimizer = optimizer
+
+        self._sd_batch_norm = sd_batch_norm
+        self._skill_dynamics_obs_dim = skill_dynamics_obs_dim
+
+        if self._sd_batch_norm:
+            self._sd_input_batch_norm = torch.nn.BatchNorm1d(self._skill_dynamics_obs_dim, momentum=0.01).to(self.device)
+            self._sd_target_batch_norm = torch.nn.BatchNorm1d(self._skill_dynamics_obs_dim, momentum=0.01, affine=False).to(self.device)
+            self._sd_input_batch_norm.eval()
+            self._sd_target_batch_norm.eval()
+
+        self._trans_minibatch_size = trans_minibatch_size
+        self._trans_optimization_epochs = trans_optimization_epochs
+
+        self.discrete = discrete
+        self.unit_length = unit_length
         self.batch_size = batch_size
 
-        # DIAYN specific attributes
-        self.diayn_intrinsic_reward_coeff = diayn_intrinsic_reward_coeff
-        self.num_skills = num_skills
+        self.traj_encoder.eval()
 
-        # Instantiate Actor network
-        self.actor = Actor(obs_shape, feature_dim, action_shape, actor_hidden_dim, actor_hidden_depth,
-                           [actor_log_std_min, actor_log_std_max], num_skills, skill_embedding_dim).to(device)
+        self.qf1 = qf1.to(self.device)
+        self.qf2 = qf2.to(self.device)
 
-        # Instantiate Critic network (and target critic)
-        self.critic = Critic(obs_shape, feature_dim, action_shape, critic_hidden_dim, critic_hidden_depth).to(device)
-        self.critic_target = Critic(obs_shape, feature_dim, action_shape, critic_hidden_dim, critic_hidden_depth).to(device)
-        self.critic_target.load_state_dict(self.critic.state_dict()) # Initialize target critic weights
+        self.target_qf1 = copy.deepcopy(self.qf1)
+        self.target_qf2 = copy.deepcopy(self.qf2)
 
-        # Important: Tie convolutional layers between actor's and critic's encoders for shared representation
-        self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
+        self.log_alpha = log_alpha.to(self.device)
 
-        # Entropy temperature alpha for SAC
-        self.log_alpha = torch.tensor(np.log(init_temperature)).to(device)
-        self.log_alpha.requires_grad = True
-        self.target_entropy = -action_shape[0] # Target entropy is usually -|A|
+        self.param_modules.update(
+            qf1=self.qf1,
+            qf2=self.qf2,
+            log_alpha=self.log_alpha,
+        )
 
-        # Optimizers
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
-        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
+        self.tau = tau
 
-        # DIAYN: Instantiate Discriminator and its optimizer
-        # feature_dim here is the output dim of the shared encoder (from critic/actor)
-        self.discriminator = Discriminator(feature_dim, num_skills,
-                                           discriminator_hidden_dim, discriminator_hidden_depth).to(device)
-        self.discriminator_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=lr_discriminator)
+        self.replay_buffer = replay_buffer
+        self.min_buffer_size = min_buffer_size
+        self.inner = inner
 
-        self.train() # Set networks to training mode
-        self.critic_target.train()
+        self.dual_reg = dual_reg
+        self.dual_slack = dual_slack
+        self.dual_dist = dual_dist
 
-    def train(self, training=True):
-        self.training = training
-        self.actor.train(training)
-        self.critic.train(training)
+        self.num_alt_samples = num_alt_samples
+        self.split_group = split_group
+
+        self._reward_scale_factor = scale_reward
+        self._target_entropy = -np.prod(self._env_spec.action_space.shape).item() / 2. * target_coef
+
+        self.pixel_shape = pixel_shape
+
+        assert self._trans_optimization_epochs is not None
+
+        self._start_time = time.time()
+        self.total_env_steps = 0
 
     @property
-    def alpha(self):
-        return self.log_alpha.exp()
+    def policy(self):
+        return {
+            'option_policy': self.option_policy,
+        }
 
-    def act(self, obs, skill, sample=False):
-        """Selects an action based on observation and current skill (if DIAYN active)."""
-        obs = torch.FloatTensor(obs).to(self.device)
-        obs = obs.unsqueeze(0) # Add batch dimension
+    def all_parameters(self):
+        for m in self.param_modules.values():
+            for p in m.parameters():
+                yield p
 
-        # Prepare skill tensor for actor
-        # Skill is expected to be a scalar int by this point from Workspace
-        skill_tensor = torch.tensor([skill], device=self.device).long()
-        if self.num_skills > 0 and skill_tensor.ndim == 1: # Actor expects batched skill input
-             skill_tensor = skill_tensor.unsqueeze(0) # Shape: [1,1] or [1] -> [1,1] for consistency with batching
+    def _get_concat_obs(self, obs, option):
+        return utils.get_torch_concat_obs(obs, option)
 
-        dist = self.actor(obs, skill_tensor if self.num_skills > 0 else None) # Pass skill to actor
-        action = dist.sample() if sample else dist.mean # Sample or take mean
-        action = action.clamp(*self.action_range) # Clamp action to valid range
-        assert action.ndim == 2 and action.shape[0] == 1, "Action output shape incorrect."
-        return utils.to_np(action[0]) # Convert to numpy array for environment
+    def _get_train_trajectories_kwargs(self):
+        if self.discrete: # False
+            extras = self._generate_option_extras(np.eye(self.dim_option)[np.random.randint(0, self.dim_option, self.batch_size)])
+        else:
+            random_options = np.random.randn(self.batch_size, self.dim_option)
+            if self.unit_length:
+                random_options /= np.linalg.norm(random_options, axis=-1, keepdims=True)
+            extras = self._generate_option_extras(random_options)
 
-    def update_critic(self, obs, obs_aug, action, reward, next_obs,
-                      next_obs_aug, not_done, skills, logger, step):
-        """Updates the critic network(s)."""
+        return dict(
+            extras=extras,
+            sampler_key='option_policy',
+        )
 
-        # DIAYN: Compute intrinsic reward using current obs and skills.
-        # The choice of (obs, skill) vs (next_obs, skill) for r_i depends on DIAYN variant.
-        # Here, r_i = log D(skill | obs) - log p(skill)
-        if self.num_skills > 0:
-            intrinsic_reward = self.compute_intrinsic_reward(obs, skills) # Use current obs
-            logger.log('train_critic/intrinsic_reward', intrinsic_reward.mean(), step)
-            # Augment extrinsic reward with intrinsic reward
-            reward = reward + self.diayn_intrinsic_reward_coeff * intrinsic_reward
-            logger.log('train_critic/total_reward', reward.mean(), step) # Log total reward for critic
+    def _flatten_data(self, data):
+        epoch_data = {}
+        for key, value in data.items():
+            epoch_data[key] = torch.tensor(np.concatenate(value, axis=0), dtype=torch.float32, device=self.device)
+        return epoch_data
 
-        with torch.no_grad(): # Operations inside this block do not track gradients
-            # Get next action and its log probability from the actor for the target Q calculation
-            dist = self.actor(next_obs, skills if self.num_skills > 0 else None)
-            next_action = dist.rsample()
-            log_prob = dist.log_prob(next_action).sum(-1, keepdim=True) # Log prob of next action
-            target_Q1, target_Q2 = self.critic_target(next_obs, next_action) # Target Q-values from target critic
-            target_V = torch.min(target_Q1, target_Q2) - self.alpha.detach() * log_prob # Target value (SAC style)
-            target_Q = reward + (not_done * self.discount * target_V) # Bellman equation
+    def _update_replay_buffer(self, data):
+        if self.replay_buffer is not None:
+            # Add paths to the replay buffer
+            for i in range(len(data['actions'])):
+                path = {}
+                for key in data.keys():
+                    cur_list = data[key][i]
+                    if cur_list.ndim == 1:
+                        cur_list = cur_list[..., np.newaxis]
+                    path[key] = cur_list
+                self.replay_buffer.add_path(path)
+    
+    def _sample_replay_buffer(self):
+        samples = self.replay_buffer.sample_transitions(self._trans_minibatch_size)
+        data = {}
+        for key, value in samples.items():
+            if value.shape[1] == 1 and 'option' not in key:
+                value = np.squeeze(value, axis=1)
+            data[key] = torch.from_numpy(value).float().to(self.device)
+        return data
+    
+    def train(self, n_epochs):
+        last_return = None
+        self.total_epoch = 0
+        with utils.GlobalContext({'phase': 'train', 'policy': 'sampling'}):
+            for self.total_epoch in tqdm.tqdm(n_epochs, desc=f'Training {self.name}'):
+                '''
+                full_tb_epochs=0,
+                log_period=self.n_epochs_per_log,
+                tb_period=self.n_epochs_per_tb,
+                pt_save_period=self.n_epochs_per_pt_save,
+                pkl_update_period=self.n_epochs_per_pkl_update,
+                new_save_period=self.n_epochs_per_save,
+                '''
+                for p in self.policy.values():
+                    p.eval()
+                self.traj_encoder.eval()
 
-            # Repeat for augmented next observations (DrQ specific)
-            dist_aug = self.actor(next_obs_aug, skills if self.num_skills > 0 else None)
-            next_action_aug = dist_aug.rsample()
-            log_prob_aug = dist_aug.log_prob(next_action_aug).sum(-1, keepdim=True)
-            target_Q1_aug, target_Q2_aug = self.critic_target(next_obs_aug, next_action_aug)
-            target_V_aug = torch.min(target_Q1_aug, target_Q2_aug) - self.alpha.detach() * log_prob_aug
-            target_Q_aug = reward + (not_done * self.discount * target_V_aug)
+                if self.n_epochs_per_eval != 0 and self.step_itr % self.n_epochs_per_eval == 0:
+                    self._evaluate_policy()
 
-            # Average target Q from original and augmented next_obs for data regularization
-            target_Q = (target_Q + target_Q_aug) / 2
+                for p in self.policy.values():
+                    p.train()
+                self.traj_encoder.train()
 
-        # Get current Q estimates from the online critic
-        current_Q1, current_Q2 = self.critic(obs, action)
-        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
-            current_Q2, target_Q)
+                for _ in range(self._num_train_per_epoch):
+                    time_sampling = [0.0]
+                    with MeasureAndAccTime(time_sampling):
+                        step_path = self._get_train_trajectories()
+                    # TODO: increment the total_env_steps
+                    self.total_env_steps += ...
+                    last_return = self.train_once(
+                        self.step_itr,
+                        step_path,
+                        extra_scalar_metrics={
+                            'TimeSampling': time_sampling[0],
+                        },
+                    )
 
-        Q1_aug, Q2_aug = self.critic(obs_aug, action)
+                self.step_itr += 1
 
-        critic_loss += F.mse_loss(Q1_aug, target_Q) + F.mse_loss(
-            Q2_aug, target_Q)
+                # TODO: logging
 
-        logger.log('train_critic/loss', critic_loss, step)
+        return last_return
 
-        # Optimize the critic
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
+    def train_once(self, itr, paths, extra_scalar_metrics={}):
+        logging_enabled = ((self.step_itr + 1) % self.n_epochs_per_log == 0)
 
-        self.critic.log(logger, step)
+        data = self.process_samples(paths)
 
-    def update_actor_and_alpha(self, obs, skills, logger, step): # Added skills
-        # Detach encoder for actor update to prevent gradients from flowing back to encoder from actor loss
-        dist = self.actor(obs, skills if self.num_skills > 0 else None, detach_encoder=True)
-        action = dist.rsample() # Sample action from policy
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True) # Log prob of sampled action
+        time_computing_metrics = [0.0]
+        time_training = [0.0]
 
-        # Detach encoder for critic when used in actor loss calculation
-        # Actor_Q values are based on the critic, which is trained on augmented rewards if DIAYN is active.
-        actor_Q1, actor_Q2 = self.critic(obs, action, detach_encoder=True)
-        actor_Q = torch.min(actor_Q1, actor_Q2) # Use min Q-value for actor update (SAC style)
+        with MeasureAndAccTime(time_training):
+            tensors = self._train_once_inner(data)
 
-        actor_loss = (self.alpha.detach() * log_prob - actor_Q).mean()
+        performence = utils.log_performance_ex(
+            itr,
+            TrajectoryBatch.from_trajectory_list(self._env_spec, paths),
+            discount=self.discount,
+        )
+        discounted_returns = performence['discounted_returns']
+        undiscounted_returns = performence['undiscounted_returns']
 
-        logger.log('train_actor/loss', actor_loss, step)
-        logger.log('train_actor/target_entropy', self.target_entropy, step)
-        logger.log('train_actor/entropy', -log_prob.mean(), step)
+        if logging_enabled:
+            prefix_tabular = utils.get_metric_prefix()
+            with utils.get_tabular().prefix(prefix_tabular + self.name + '/'), utils.get_tabular(
+                    'plot').prefix(prefix_tabular + self.name + '/'):
+                def _record_scalar(key, val):
+                    utils.get_tabular().record(key, val)
 
-        # optimize the actor
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+                def _record_histogram(key, val):
+                    utils.get_tabular('plot').record(key, Histogram(val))
 
-        self.actor.log(logger, step)
+                for k in tensors.keys():
+                    if tensors[k].numel() == 1:
+                        _record_scalar(f'{k}', tensors[k].item())
+                    else:
+                        _record_scalar(f'{k}', np.array2string(tensors[k].detach().cpu().numpy(), suppress_small=True))
+                with torch.no_grad():
+                    total_norm = compute_total_norm(self.all_parameters())
+                    _record_scalar('TotalGradNormAll', total_norm.item())
+                    for key, module in self.param_modules.items():
+                        total_norm = compute_total_norm(module.parameters())
+                        _record_scalar(f'TotalGradNorm{key.replace("_", " ").title().replace(" ", "")}', total_norm.item())
+                for k, v in extra_scalar_metrics.items():
+                    _record_scalar(k, v)
+                _record_scalar('TimeComputingMetrics', time_computing_metrics[0])
+                _record_scalar('TimeTraining', time_training[0])
 
-        self.log_alpha_optimizer.zero_grad()
-        alpha_loss = (self.alpha *
-                      (-log_prob - self.target_entropy).detach()).mean()
-        logger.log('train_alpha/loss', alpha_loss, step)
-        logger.log('train_alpha/value', self.alpha, step)
-        alpha_loss.backward()
-        self.log_alpha_optimizer.step()
+                path_lengths = [
+                    len(path['actions'])
+                    for path in paths
+                ]
+                _record_scalar('PathLengthMean', np.mean(path_lengths))
+                _record_scalar('PathLengthMax', np.max(path_lengths))
+                _record_scalar('PathLengthMin', np.min(path_lengths))
 
-    def update(self, replay_buffer, logger, step):
-        obs, action, reward, next_obs, not_done, obs_aug, next_obs_aug, skills = replay_buffer.sample(
-            self.batch_size)
+                _record_histogram('ExternalDiscountedReturns', np.asarray(discounted_returns))
+                _record_histogram('ExternalUndiscountedReturns', np.asarray(undiscounted_returns))
 
-        # Note: extrinsic reward is already augmented with intrinsic_reward in update_critic if DIAYN is active.
-        # This step is where intrinsic rewards influence the policy via critic's Q-values.
+        return np.mean(undiscounted_returns)
 
-        # Update critic using observations, actions, and augmented rewards
-        self.update_critic(obs, obs_aug, action, reward, next_obs,
-                           next_obs_aug, not_done, skills, logger, step)
+    def _train_once_inner(self, path_data):
+        self._update_replay_buffer(path_data)
 
-        # Update actor and temperature alpha (SAC update)
-        if step % self.actor_update_frequency == 0:
-            self.update_actor_and_alpha(obs, skills, logger, step) # Pass skills for skill-conditioned actor
+        epoch_data = self._flatten_data(path_data)
 
-        # Update target critic network (soft update)
-        if step % self.critic_target_update_frequency == 0:
-            utils.soft_update_params(self.critic, self.critic_target, self.critic_tau)
+        tensors = self._train_components(epoch_data)
 
-        # DIAYN: Update discriminator
-        if self.num_skills > 0: # Only update discriminator if DIAYN is active
-            self.update_discriminator(obs, skills, logger, step) # Use current obs and skills from buffer
+        return tensors
 
-    def compute_intrinsic_reward(self, obs, skill):
-        """
-        Computes the DIAYN intrinsic reward: r_i = log D(z|s) - log p(z).
-        Args:
-            obs (torch.Tensor): Batch of observations (states).
-            skill (torch.Tensor): Batch of skills (actions/latents z).
-        Returns:
-            torch.Tensor: Batch of intrinsic rewards.
-        """
-        if self.num_skills == 0: # Should not be called if no skills
-            return torch.zeros((obs.size(0), 1), device=self.device)
+    def _train_components(self, epoch_data):
+        if self.replay_buffer is not None and self.replay_buffer.n_transitions_stored < self.min_buffer_size:
+            return {}
 
-        # Encode observation to get features (state representation)
-        # Use no_grad as this is for reward calculation, not for training the encoder here.
-        # detach=True on encoder output ensures no gradients flow back to encoder from discriminator.
-        with torch.no_grad():
-            features = self.critic.encoder(obs, detach=True)
+        for _ in range(self._trans_optimization_epochs):
+            tensors = {}
 
-        # Get skill logits from discriminator D(z|s)
-        skill_logits = self.discriminator(features)
+            if self.replay_buffer is None:
+                v = self._get_mini_tensors(epoch_data)
+            else:
+                v = self._sample_replay_buffer()
 
-        # Calculate log p(z|s) using cross-entropy trick or manual log_softmax
-        # skill is [batch_size, 1], .long() for gather
-        skill = skill.reshape((-1, 1))
-        log_p_z_s = F.log_softmax(skill_logits, dim=-1).gather(1, skill.long())
+            self._optimize_te(tensors, v)
+            self._update_rewards(tensors, v)
+            self._optimize_op(tensors, v)
 
-        # Calculate log p(z) - assuming a uniform prior over skills
-        # log p(z) = -log(num_skills) since p(z) = 1/num_skills
-        log_p_z_uniform = -torch.log(torch.tensor(self.num_skills, dtype=torch.float32, device=skill_logits.device))
+        return tensors
+    
+    def _gradient_descent(self, loss, optimizer_keys):
+        self._optimizer.zero_grad(keys=optimizer_keys)
+        loss.backward()
+        self._optimizer.step(keys=optimizer_keys)
 
-        intrinsic_reward = log_p_z_s - log_p_z_uniform
+    def _optimize_te(self, tensors, internal_vars):
+        self._update_loss_te(tensors, internal_vars)
 
-        return intrinsic_reward.reshape((-1, 1)) # Ensure shape [batch_size, 1]
+        self._gradient_descent(
+            tensors['LossTe'],
+            optimizer_keys=['traj_encoder'],
+        )
 
-    def update_discriminator(self, obs, skill, logger, step):
-        """
-        Updates the DIAYN skill discriminator D(z|s).
-        Args:
-            obs (torch.Tensor): Batch of observations (states).
-            skill (torch.Tensor): Batch of skills (true labels for discriminator).
-            logger (Logger): Logger object for recording metrics.
-            step (int): Current training step.
-        """
-        # Get features from observation (state representation)
-        # Use no_grad as encoder is trained by critic/actor, not directly by discriminator.
-        with torch.no_grad():
-            features = self.critic.encoder(obs, detach=True)
+        if self.dual_reg:
+            self._update_loss_dual_lam(tensors, internal_vars)
+            self._gradient_descent(
+                tensors['LossDualLam'],
+                optimizer_keys=['dual_lam'],
+            )
+            if self.dual_dist == 's2_from_s':
+                self._gradient_descent(
+                    tensors['LossDp'],
+                    optimizer_keys=['dist_predictor'],
+                )
 
-        # Predict skill logits using the discriminator
-        predicted_skill_logits = self.discriminator(features)
+    def _optimize_op(self, tensors, internal_vars):
+        self._update_loss_qf(tensors, internal_vars)
 
-        # Calculate discriminator loss (cross-entropy between predicted skill and actual skill)
-        # skill is [batch_size, 1], squeeze to [batch_size] for cross_entropy target.
-        discriminator_loss = F.cross_entropy(predicted_skill_logits, skill.squeeze(-1).long())
+        self._gradient_descent(
+            tensors['LossQf1'] + tensors['LossQf2'],
+            optimizer_keys=['qf'],
+        )
 
-        logger.log('train_discriminator/loss', discriminator_loss, step)
+        self._update_loss_op(tensors, internal_vars)
+        self._gradient_descent(
+            tensors['LossSacp'],
+            optimizer_keys=['option_policy'],
+        )
 
-        # Optimize the discriminator
-        self.discriminator_optimizer.zero_grad()
-        discriminator_loss.backward()
-        self.discriminator_optimizer.step()
+        self._update_loss_alpha(tensors, internal_vars)
+        self._gradient_descent(
+            tensors['LossAlpha'],
+            optimizer_keys=['log_alpha'],
+        )
 
-    def save(self, save_path):
-        params_dict = {}
-        params_dict['actor'] = self.actor.state_dict()
-        params_dict['critic'] = self.critic.state_dict()
-        params_dict['critic_target'] = self.critic_target.state_dict()
-        params_dict['discriminator'] = self.discriminator.state_dict()
-        params_dict['log_alpha'] = self.log_alpha
-        params_dict['actor_optimizer'] = self.actor_optimizer.state_dict()
-        params_dict['critic_optimizer'] = self.critic_optimizer.state_dict()
-        params_dict['discriminator_optimizer'] = self.discriminator_optimizer.state_dict()
-        params_dict['log_alpha_optimizer'] = self.log_alpha_optimizer.state_dict()
-        torch.save(params_dict, save_path)
+        sac_utils.update_targets(self)
 
-    def load(self, load_path, device='cpu'):
-        params_dict = torch.load(load_path, map_location=device)
-        self.actor.load_state_dict(params_dict['actor'])
-        self.critic.load_state_dict(params_dict['critic'])
-        self.critic_target.load_state_dict(params_dict['critic_target'])
-        self.discriminator.load_state_dict(params_dict['discriminator'])
-        self.log_alpha = params_dict['log_alpha']
-        self.actor_optimizer.load_state_dict(params_dict['actor_optimizer'])
-        self.critic_optimizer.load_state_dict(params_dict['critic_optimizer'])
-        self.discriminator_optimizer.load_state_dict(params_dict['discriminator_optimizer'])
-        self.log_alpha_optimizer.load_state_dict(params_dict['log_alpha_optimizer'])
-        
+    def _update_rewards(self, tensors, v):
+        obs = v['obs']
+        next_obs = v['next_obs']
+
+        if self.inner:
+            cur_z = self.traj_encoder(obs).mean
+            next_z = self.traj_encoder(next_obs).mean
+            target_z = next_z - cur_z
+
+            if self.discrete:
+                masks = (v['options'] - v['options'].mean(dim=1, keepdim=True)) * self.dim_option / (self.dim_option - 1 if self.dim_option != 1 else 1)
+                rewards = (target_z * masks).sum(dim=1)
+            else:
+                inner = (target_z * v['options']).sum(dim=1)
+                rewards = inner
+
+            # For dual objectives
+            v.update({
+                'cur_z': cur_z,
+                'next_z': next_z,
+            })
+        else:
+            target_dists = self.traj_encoder(next_obs)
+
+            if self.discrete:
+                logits = target_dists.mean
+                rewards = -torch.nn.functional.cross_entropy(logits, v['options'].argmax(dim=1), reduction='none')
+            else:
+                rewards = target_dists.log_prob(v['options'])
+
+        tensors.update({
+            'PureRewardMean': rewards.mean(),
+            'PureRewardStd': rewards.std(),
+        })
+
+        v['rewards'] = rewards
+
+    def _update_loss_te(self, tensors, v):
+        self._update_rewards(tensors, v)
+        rewards = v['rewards']
+
+        obs = v['obs']
+        next_obs = v['next_obs']
+
+        if self.dual_dist == 's2_from_s':
+            s2_dist = self.dist_predictor(obs)
+            loss_dp = -s2_dist.log_prob(next_obs - obs).mean()
+            tensors.update({
+                'LossDp': loss_dp,
+            })
+
+        if self.dual_reg:
+            dual_lam = self.dual_lam.param.exp()
+            x = obs
+            y = next_obs
+            phi_x = v['cur_z']
+            phi_y = v['next_z']
+
+            if self.dual_dist == 'l2':
+                cst_dist = torch.square(y - x).mean(dim=1)
+            elif self.dual_dist == 'one':
+                cst_dist = torch.ones_like(x[:, 0])
+            elif self.dual_dist == 's2_from_s':
+                s2_dist = self.dist_predictor(obs)
+                s2_dist_mean = s2_dist.mean
+                s2_dist_std = s2_dist.stddev
+                scaling_factor = 1. / s2_dist_std
+                geo_mean = torch.exp(torch.log(scaling_factor).mean(dim=1, keepdim=True))
+                normalized_scaling_factor = (scaling_factor / geo_mean) ** 2
+                cst_dist = torch.mean(torch.square((y - x) - s2_dist_mean) * normalized_scaling_factor, dim=1)
+
+                tensors.update({
+                    'ScalingFactor': scaling_factor.mean(dim=0),
+                    'NormalizedScalingFactor': normalized_scaling_factor.mean(dim=0),
+                })
+            else:
+                raise NotImplementedError
+
+            cst_penalty = cst_dist - torch.square(phi_y - phi_x).mean(dim=1)
+            cst_penalty = torch.clamp(cst_penalty, max=self.dual_slack)
+            te_obj = rewards + dual_lam.detach() * cst_penalty
+
+            v.update({
+                'cst_penalty': cst_penalty
+            })
+            tensors.update({
+                'DualCstPenalty': cst_penalty.mean(),
+            })
+        else:
+            te_obj = rewards
+
+        loss_te = -te_obj.mean()
+
+        tensors.update({
+            'TeObjMean': te_obj.mean(),
+            'LossTe': loss_te,
+        })
+
+    def _update_loss_dual_lam(self, tensors, v):
+        log_dual_lam = self.dual_lam.param
+        dual_lam = log_dual_lam.exp()
+        loss_dual_lam = log_dual_lam * (v['cst_penalty'].detach()).mean()
+
+        tensors.update({
+            'DualLam': dual_lam,
+            'LossDualLam': loss_dual_lam,
+        })
+
+    def _update_loss_qf(self, tensors, v):
+        processed_cat_obs = self._get_concat_obs(v['obs'], v['options'])
+        next_processed_cat_obs = self._get_concat_obs(v['next_obs'], v['next_options'])
+
+        sac_utils.update_loss_qf(
+            self, tensors, v,
+            obs=processed_cat_obs,
+            actions=v['actions'],
+            next_obs=next_processed_cat_obs,
+            dones=v['dones'],
+            rewards=v['rewards'] * self._reward_scale_factor,
+            policy=self.option_policy,
+        )
+
+        v.update({
+            'processed_cat_obs': processed_cat_obs,
+            'next_processed_cat_obs': next_processed_cat_obs,
+        })
+
+    def _update_loss_op(self, tensors, v):
+        processed_cat_obs = self._get_concat_obs(v['obs'], v['options'])
+        sac_utils.update_loss_sacp(
+            self, tensors, v,
+            obs=processed_cat_obs,
+            policy=self.option_policy,
+        )
+
+    def _update_loss_alpha(self, tensors, v):
+        sac_utils.update_loss_alpha(
+            self, tensors, v,
+        )
+
+    def _get_mini_tensors(self, epoch_data):
+        num_transitions = len(epoch_data['actions'])
+        idxs = np.random.choice(num_transitions, self._trans_minibatch_size)
+
+        data = {}
+        for key, value in epoch_data.items():
+            data[key] = value[idxs]
+
+        return data
+
+    def _evaluate_policy(self):
+        if self.discrete:
+            eye_options = np.eye(self.dim_option)
+            random_options = []
+            colors = []
+            for i in range(self.dim_option):
+                num_trajs_per_option = self.num_random_trajectories // self.dim_option + (i < self.num_random_trajectories % self.dim_option)
+                for _ in range(num_trajs_per_option):
+                    random_options.append(eye_options[i])
+                    colors.append(i)
+            random_options = np.array(random_options)
+            colors = np.array(colors)
+            num_evals = len(random_options)
+            from matplotlib import cm
+            cmap = 'tab10' if self.dim_option <= 10 else 'tab20'
+            random_option_colors = []
+            for i in range(num_evals):
+                random_option_colors.extend([cm.get_cmap(cmap)(colors[i])[:3]])
+            random_option_colors = np.array(random_option_colors)
+        else:
+            random_options = np.random.randn(self.num_random_trajectories, self.dim_option)
+            if self.unit_length:
+                random_options = random_options / np.linalg.norm(random_options, axis=1, keepdims=True)
+            random_option_colors = utils.get_option_colors(random_options * 4)
+        random_trajectories = self._get_trajectories(
+            sampler_key='option_policy',
+            extras=self._generate_option_extras(random_options),
+            worker_update=dict(
+                _render=False,
+                _deterministic_policy=True,
+            ),
+            env_update=dict(_action_noise_std=None),
+        )
+
+        with utils.FigManager(self.snapshot_dir, self.step_itr, 'TrajPlot_RandomZ') as fm:
+            self._env.render_trajectories( # TODO:
+                random_trajectories, random_option_colors, self.eval_plot_axis, fm.ax
+            )
+
+        data = self.process_samples(random_trajectories)
+        last_obs = torch.stack([torch.from_numpy(ob[-1]).to(self.device) for ob in data['obs']])
+        option_dists = self.traj_encoder(last_obs)
+
+        option_means = option_dists.mean.detach().cpu().numpy()
+        if self.inner:
+            option_stddevs = torch.ones_like(option_dists.stddev.detach().cpu()).numpy()
+        else:
+            option_stddevs = option_dists.stddev.detach().cpu().numpy()
+        option_samples = option_dists.mean.detach().cpu().numpy()
+
+        option_colors = random_option_colors
+
+        with utils.FigManager(self.snapshot_dir, self.step_itr, f'PhiPlot') as fm:
+            utils.draw_2d_gaussians(option_means, option_stddevs, option_colors, fm.ax)
+            utils.draw_2d_gaussians(
+                option_samples,
+                [[0.03, 0.03]] * len(option_samples),
+                option_colors,
+                fm.ax,
+                fill=True,
+                use_adaptive_axis=True,
+            )
+
+        eval_option_metrics = {}
+
+        # Videos
+        if self.eval_record_video:
+            if self.discrete:
+                video_options = np.eye(self.dim_option)
+                video_options = video_options.repeat(self.num_video_repeats, axis=0)
+            else:
+                if self.dim_option == 2:
+                    radius = 1. if self.unit_length else 1.5
+                    video_options = []
+                    for angle in [3, 2, 1, 4]:
+                        video_options.append([radius * np.cos(angle * np.pi / 4), radius * np.sin(angle * np.pi / 4)])
+                    video_options.append([0, 0])
+                    for angle in [0, 5, 6, 7]:
+                        video_options.append([radius * np.cos(angle * np.pi / 4), radius * np.sin(angle * np.pi / 4)])
+                    video_options = np.array(video_options)
+                else:
+                    video_options = np.random.randn(9, self.dim_option)
+                    if self.unit_length:
+                        video_options = video_options / np.linalg.norm(video_options, axis=1, keepdims=True)
+                video_options = video_options.repeat(self.num_video_repeats, axis=0)
+            video_trajectories = self._get_trajectories(
+                sampler_key='local_option_policy',
+                extras=self._generate_option_extras(video_options),
+                worker_update=dict(
+                    _render=True,
+                    _deterministic_policy=True,
+                ),
+            )
+            utils.record_video(self.snapshot_dir, self.step_itr, 'Video_RandomZ', video_trajectories, skip_frames=self.video_skip_frames)
+
+        eval_option_metrics.update(self._env.calc_eval_metrics(random_trajectories, is_option_trajectories=True)) # TODO:
+        with utils.GlobalContext({'phase': 'eval', 'policy': 'option'}):
+            utils.log_performance_ex(
+                self.step_itr,
+                TrajectoryBatch.from_trajectory_list(self._env_spec, random_trajectories),
+                discount=self.discount,
+                additional_records=eval_option_metrics,
+            )
+        self._log_eval_metrics()
+
+    def _generate_option_extras(self, options):
+        return [{'option': option} for option in options]
+
+    def _get_train_trajectories(self):
+        default_kwargs = dict(
+            update_stats=True,
+            worker_update=dict(
+                _render=False,
+                _deterministic_policy=False,
+            ),
+            env_update=dict(_action_noise_std=None),
+        )
+        kwargs = dict(default_kwargs, **self._get_train_trajectories_kwargs())
+
+        paths = self._get_trajectories(**kwargs)
+
+        return paths
+
+    def _get_trajectories(self,
+                          sampler_key,
+                          batch_size=None,
+                          extras=None,
+                          update_stats=False,
+                          worker_update=None,
+                          env_update=None):
+        if batch_size is None:
+            batch_size = len(extras)
+        policy_sampler_key = sampler_key[6:] if sampler_key.startswith('local_') else sampler_key
+        time_get_trajectories = [0.0]
+        with MeasureAndAccTime(time_get_trajectories):
+            trajectories, infos = obtain_exact_trajectories( # TODO:
+                self.step_itr,
+                sampler_key=sampler_key,
+                batch_size=batch_size,
+                agent_update=self._get_policy_param_values(policy_sampler_key),
+                env_update=env_update,
+                worker_update=worker_update,
+                extras=extras,
+                update_stats=update_stats,
+            )
+        print(f'_get_trajectories({sampler_key}) {time_get_trajectories[0]}s')
+
+        for traj in trajectories:
+            for key in ['ori_obs', 'next_ori_obs', 'coordinates', 'next_coordinates']:
+                if key not in traj['env_infos']:
+                    continue
+
+        return trajectories
+
+    def _get_policy_param_values(self, key):
+        param_dict = self.policy[key].get_param_values()
+        for k in param_dict.keys():
+            if self.sample_cpu:
+                param_dict[k] = param_dict[k].detach().cpu()
+            else:
+                param_dict[k] = param_dict[k].detach()
+        return param_dict
 
 
-class Discriminator(nn.Module):
-    """
-    DIAYN Discriminator network D(z|s).
-    Predicts the skill 'z' given the current state 's'.
-    """
-    def __init__(self, feature_dim, num_skills, hidden_dim=1024, hidden_depth=2):
-        """
-        Args:
-            feature_dim (int): Dimension of the input features (from encoder).
-            num_skills (int): Number of skills to classify (output dimension).
-            hidden_dim (int): Dimension of hidden layers.
-            hidden_depth (int): Number of hidden layers.
-        """
-        super().__init__()
-        # MLP structure for the discriminator
-        # Note: utils.mlp typically adds a ReLU after the last linear layer if output_dim > 1.
-        # For classification logits, a final ReLU is undesirable.
-        # So, constructing layers manually here to ensure no final activation on logits.
-        layers = []
-        current_dim = feature_dim
-        for _ in range(hidden_depth):
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            current_dim = hidden_dim
-        layers.append(nn.Linear(current_dim, num_skills)) # Output layer for skill logits
-        self.trunk = nn.Sequential(*layers)
+    def _log_eval_metrics(self):
+        self.eval_log_diagnostics()
+        self.plot_log_diagnostics()
 
-        self.apply(utils.weight_init) # Apply weight initialization
+    def process_samples(self, paths):
+        data = defaultdict(list)
+        for path in paths:
+            data['obs'].append(path['observations'])
+            data['next_obs'].append(path['next_observations'])
+            data['actions'].append(path['actions'])
+            data['rewards'].append(path['rewards'])
+            data['dones'].append(path['dones'])
+            data['returns'].append(utils.discount_cumsum(path['rewards'], self.discount))
+            data['ori_obs'].append(path['env_infos']['ori_obs'])
+            data['next_ori_obs'].append(path['env_infos']['next_ori_obs'])
+            if 'pre_tanh_value' in path['agent_infos']:
+                data['pre_tanh_values'].append(path['agent_infos']['pre_tanh_value'])
+            if 'log_prob' in path['agent_infos']:
+                data['log_probs'].append(path['agent_infos']['log_prob'])
+            if 'option' in path['agent_infos']:
+                data['options'].append(path['agent_infos']['option'])
+                data['next_options'].append(np.concatenate([path['agent_infos']['option'][1:], path['agent_infos']['option'][-1:]], axis=0))
 
-    def forward(self, features):
-        """
-        Forward pass of the discriminator.
-        Args:
-            features (torch.Tensor): Input features (encoded state).
-        Returns:
-            torch.Tensor: Logits for skill classification.
-        """
-        return self.trunk(features)
+        return data
+
+
+    def eval_log_diagnostics(self):
+        total_time = (time.time() - self._start_time)
+        utils.get_tabular('eval').record('TotalEnvSteps', self.total_env_steps)
+        utils.get_tabular('eval').record('TotalEpoch', self.total_epoch)
+        utils.get_tabular('eval').record('TimeTotal', total_time)
+        utils.get_logger('eval').log(utils.get_tabular('eval'))
+        utils.get_logger('eval').dump_all(self.step_itr)
+        utils.get_tabular('eval').clear()
+
+    def plot_log_diagnostics(self):
+        utils.get_tabular('plot').record('TotalEnvSteps', self.total_env_steps)
+        utils.get_tabular('plot').record('TotalEpoch', self.total_epoch)
+        utils.get_logger('plot').log(utils.get_tabular('plot'))
+        utils.get_logger('plot').dump_all(self.step_itr)
+        utils.get_tabular('plot').clear()
