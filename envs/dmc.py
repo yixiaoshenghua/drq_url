@@ -8,7 +8,7 @@ import tqdm
 
 class DMC:
 
-    def __init__(self, name, action_repeat=1, size=(64, 64), camera=None):
+    def __init__(self, name, action_repeat=1, size=(64, 64), camera=None, flatten_obs=False):
         os.environ["MUJOCO_GL"] = "egl"
         domain, task = name.split("_", 1)
         if domain == "cup":  # Only domain with multiple words.
@@ -58,6 +58,7 @@ class DMC:
             if value.shape == (0,):
                 print(f"Ignoring empty observation key '{key}'.")
                 self._ignored_keys.append(key)
+        self.flatten_obs = flatten_obs
 
     @property
     def obs_space(self):
@@ -68,6 +69,7 @@ class DMC:
             "is_first": gym.spaces.Box(0, 1, (), dtype=bool),
             "is_last": gym.spaces.Box(0, 1, (), dtype=bool),
             "is_terminal": gym.spaces.Box(0, 1, (), dtype=bool),
+            "info": dict(),
         }
         for key, value in self._env.observation_spec().items():
             if key in self._ignored_keys:
@@ -101,7 +103,8 @@ class DMC:
             "is_first": False,
             "is_last": time_step.last(),
             "is_terminal": time_step.discount == 0,
-            "image": self._env.physics.render(*self._size, camera_id=self._camera),
+            "image": self.render(),
+            "info": dict(),
         }
         obs.update(
             {
@@ -120,7 +123,8 @@ class DMC:
             "is_first": True,
             "is_last": False,
             "is_terminal": False,
-            "image": self._env.physics.render(*self._size, camera_id=self._camera),
+            "image": self.render(),
+            "info": dict(),
         }
         obs.update(
             {
@@ -129,6 +133,12 @@ class DMC:
                 if k not in self._ignored_keys
             }
         )
+        return obs
+    
+    def render(self, mode='offscreen'):
+        obs = self._env.physics.render(*self._size, camera_id=self._camera)
+        if self.flatten_obs:
+            obs = obs.flatten()
         return obs
 
 

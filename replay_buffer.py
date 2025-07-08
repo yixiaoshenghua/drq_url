@@ -7,15 +7,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import utils
+from envs.wrappers import Box
 import collections
 from collections import defaultdict
-
-class Box(gym.spaces.Box):
-    """A Box space with a custom `flat_dim` property."""
-    @property
-    def flat_dim(self):
-        """Return the flattened dimension of the box."""
-        return int(np.prod(self.shape))
 
 class ReplayBuffer(object):
     """Buffer to store environment transitions."""
@@ -726,7 +720,7 @@ class SkillRolloutWorker:
     def __init__(
             self,
             seed,
-            max_path_length,
+            time_limit,
             cur_extra_keys,
     ):
         self._observations = []
@@ -739,12 +733,12 @@ class SkillRolloutWorker:
         self._env_infos = defaultdict(list)
         self._prev_obs = None
         self._path_length = 0
-        self._max_path_length_override = None
+        self._time_limit_override = None
         self._cur_extra_keys = cur_extra_keys
         self._render = False
         self._deterministic_policy = None
         self._seed = seed
-        self._max_path_length = max_path_length
+        self._time_limit = time_limit
         self.worker_init()
 
     def worker_init(self):
@@ -761,8 +755,8 @@ class SkillRolloutWorker:
     def start_rollout(self, env, policy, deterministic_policy=False):
         """Begin a new rollout."""
 
-        while hasattr(env, 'env'):
-            env = getattr(env, 'env')
+        # while hasattr(env, 'env'):
+        #     env = getattr(env, 'env')
 
         self._path_length = 0
         timestep = env.reset()
@@ -777,11 +771,11 @@ class SkillRolloutWorker:
 
         Returns:
             bool: True iff the path is done, either due to the environment
-            indicating termination of due to reaching `max_path_length`.
+            indicating termination of due to reaching `time_limit`.
 
         """
-        cur_max_path_length = self._max_path_length if self._max_path_length_override is None else self._max_path_length_override
-        if self._path_length < cur_max_path_length:
+        cur_time_limit = self._time_limit if self._time_limit_override is None else self._time_limit_override
+        if self._path_length < cur_time_limit:
             if 'skill' in self._cur_extra_keys:
                 cur_extra_key = 'skill'
             else:
@@ -822,7 +816,7 @@ class SkillRolloutWorker:
         self._last_observations.append(self._prev_obs)
         return True
 
-    def collect_rollout(self):
+    def collect_rollout(self, env):
         """Collect the current rollout, clearing the internal buffer.
 
         Returns:
@@ -850,7 +844,7 @@ class SkillRolloutWorker:
             env_infos[k] = np.asarray(v)
         lengths = self._lengths
         self._lengths = []
-        return TrajectoryBatch(self.env.spec, np.asarray(observations),
+        return TrajectoryBatch(env.spec, np.asarray(observations),
                                np.asarray(last_observations),
                                np.asarray(actions), np.asarray(rewards),
                                np.asarray(terminals), dict(env_infos),
@@ -868,5 +862,5 @@ class SkillRolloutWorker:
         self.start_rollout(env, policy, deterministic_policy=deterministic_policy)
         while not self.step_rollout(env, policy, extra):
             pass
-        return self.collect_rollout()
+        return self.collect_rollout(env)
 

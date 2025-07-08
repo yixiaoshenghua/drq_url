@@ -1,13 +1,15 @@
-from .carla import Carla
-from .dmc import DMC, RandomVideoSource
-from .dmc_remastered import DMCRemastered
-from .metaworld import MetaWorld, ViewMetaWorld, MultiViewMetaWorld
-from .wrappers import *
-from .robodesk import RoboDesk
-# from .od_mujoco import OffDynamicsMujocoEnv
-# from .od_envs import *
-from .rlbench import RLBench
+# from .carla import Carla
+# from .dmc import DMC, RandomVideoSource
+# from .dmc_remastered import DMCRemastered
+# from .metaworld import MetaWorld, ViewMetaWorld, MultiViewMetaWorld
+
+# from .robodesk import RoboDesk
+# # from .od_mujoco import OffDynamicsMujocoEnv
+# # from .od_envs import *
+# from .rlbench import RLBench
+# from .gym_env import CarRacingEnv
 # from .minecraft import Minecraft
+from .wrappers import *
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -15,7 +17,12 @@ def make_env(mode, config, llm_packages=None):
         suite, task = config.task.split("_", 1)
         if suite == "dmc":
             env = DMC(
-                task, config.action_repeat, (config.render_size, config.render_size), config.dmc_camera)
+                task, config.action_repeat, (config.render_size, config.render_size), config.dmc_camera, flatten_obs=config.flatten_obs)
+            env = NormalizeAction(env)
+        elif suite == "gym":
+            env = CarRacingEnv(
+                task, config.seed, config.action_repeat, (config.render_size, config.render_size), flatten_obs=config.flatten_obs
+            )
             env = NormalizeAction(env)
         elif suite == "dmcdriving":
             env = DMC(
@@ -30,6 +37,7 @@ def make_env(mode, config, llm_packages=None):
                 config.action_repeat,
                 (config.render_size, config.render_size),
                 config.camera,
+                flatten_obs=config.flatten_obs
             )
             env = NormalizeAction(env)
         elif suite == "mvmetaworld":
@@ -75,6 +83,9 @@ def make_env(mode, config, llm_packages=None):
         elif suite == "minecraft":
             env = Minecraft(task, config.seed, config.action_repeat, (config.render_size, config.render_size), config.sim_size, config.eval_hard_reset_every if mode == "eval" else config.hard_reset_every)
             env = MultiDiscreteAction(env)
+        elif suite == "debug":
+            env = DummyEnv(name=task, seed=config.seed, action_repeat=config.action_repeat, size=(config.render_size, config.render_size), flatten_obs=config.flatten_obs)
+            env = NormalizeAction(env)
         else:
             raise NotImplementedError(suite)
         # if config.llm_acs_wrap:

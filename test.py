@@ -60,7 +60,7 @@ class Workspace(object):
 
         # Prepare parameters for DRQ_DIAYNAgent instantiation from args
         agent_params = {
-            'obs_shape': self.env.obs_space["image"].shape,
+            'obs_shape': self.env.obs_space['image'].shape,
             'action_shape': self.env.act_space["action"].shape,
             'action_range': [float(self.env.act_space["action"].low.min()), float(self.env.act_space["action"].high.max())],
             'device': self.device,

@@ -10,7 +10,7 @@ import mujoco
 
 class MetaWorld:
 
-    def __init__(self, name, seed=None, action_repeat=1, size=(64, 64), camera='corner', use_gripper=False):
+    def __init__(self, name, seed=None, action_repeat=1, size=(64, 64), camera='corner', use_gripper=False, flatten_obs=False):
         '''
         camera: one of ['corner', 'topview', 'behindGripper', 'gripperPOV']
         '''
@@ -42,6 +42,7 @@ class MetaWorld:
         self._use_gripper = use_gripper
 
         self._camera = camera
+        self.flatten_obs = flatten_obs
 
     @property
     def obs_space(self):
@@ -53,6 +54,7 @@ class MetaWorld:
             "is_terminal": gym.spaces.Box(0, 1, (), dtype=bool),
             # "state": self._env.observation_space,
             "success": gym.spaces.Box(0, 1, (), dtype=bool),
+            "info": dict(),
         }
         if self._use_gripper:
             spaces["gripper_image"] = gym.spaces.Box(0, 255, self._size + (3,), dtype=np.uint8)
@@ -85,6 +87,7 @@ class MetaWorld:
             # ),
             # "state": state,
             "success": success,
+            "info": dict(),
         }
         if self._use_gripper:
             obs["gripper_image"] = self._env.sim.render(
@@ -108,6 +111,7 @@ class MetaWorld:
             # ),
             # "state": state,
             "success": False,
+            "info": dict(),
         }
         if self._use_gripper:
             obs["gripper_image"] = self._env.sim.render(
@@ -116,7 +120,10 @@ class MetaWorld:
         return obs
 
     def render(self, mode='offscreen'):
-        return cv2.resize(self._env.render()[::-1], self._size)
+        obs = cv2.resize(self._env.render()[::-1], self._size)
+        if self.flatten_obs:
+            obs = obs.flatten()
+        return obs
     
 
 class MultiViewMetaWorld:

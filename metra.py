@@ -1,4 +1,5 @@
 import numpy as np
+import os
 from math import inf
 import torch
 import torch.nn as nn
@@ -7,7 +8,8 @@ import copy
 import math
 import time
 import utils
-from dowel import Histogram, logger
+import dowel
+from dowel import logger, tabular, Histogram, TextOutput, CsvOutput, StdOutput
 from replay_buffer import TrajectoryBatch, SkillRolloutWorker
 import sac_utils
 from collections import defaultdict
@@ -167,7 +169,7 @@ class DRQ_METRAAgent:
             skill_dynamics,
             dist_predictor,
             alpha,
-            max_path_length,
+            time_limit,
             n_epochs_per_eval,
             n_epochs_per_log,
             n_epochs_per_tb,
@@ -209,12 +211,13 @@ class DRQ_METRAAgent:
         self.env_name = env_name
         self.algo = algo
         self.seed = seed
+        self.enable_logging = True
 
         self.step_itr = 0
         self.snapshot_dir = snapshot_dir
 
         self.discount = discount
-        self.max_path_length = max_path_length
+        self.time_limit = time_limit
 
         self.device = device
         self.sample_cpu = sample_cpu
@@ -238,12 +241,13 @@ class DRQ_METRAAgent:
                 return WithEncoder(encoder=encoder, module=module)
 
             example_encoder = make_encoder()
-            module_obs_dim = example_encoder(torch.as_tensor(example_ob).float().unsqueeze(0)).shape[-1]
+            module_obs_dim = example_encoder(torch.as_tensor(example_ob["image"]).float().unsqueeze(0)).shape[-1]
         policy_q_input_dim = module_obs_dim + dim_skill
         action_dim = self._env.spec.action_space.flat_dim
         master_dims = [model_master_dim] * model_master_num_layers
         self.skill_policy = PolicyEx(
             name='skill_policy',
+            env_spec=env_spec,
             module=with_encoder(GaussianMLPTwoHeadedModuleEx(
                 input_dim=policy_q_input_dim,
                 output_dim=action_dim,
@@ -311,7 +315,7 @@ class DRQ_METRAAgent:
             self.param_modules['dist_predictor'] = self.dist_predictor
 
         optimizers = {
-            'option_policy': torch.optim.Adam([
+            'skill_policy': torch.optim.Adam([
                 {'params': self.skill_policy.parameters(), 'lr': _finalize_lr(lr_op)},
             ]),
             'traj_encoder': torch.optim.Adam([
@@ -354,14 +358,14 @@ class DRQ_METRAAgent:
         self.video_skip_frames = video_skip_frames
         self.eval_plot_axis = eval_plot_axis
 
-        self._sd_batch_norm = sd_batch_norm
-        self._skill_dynamics_obs_dim = skill_dynamics_obs_dim
+        # self._sd_batch_norm = sd_batch_norm
+        # self._skill_dynamics_obs_dim = skill_dynamics_obs_dim
 
-        if self._sd_batch_norm:
-            self._sd_input_batch_norm = torch.nn.BatchNorm1d(self._skill_dynamics_obs_dim, momentum=0.01).to(self.device)
-            self._sd_target_batch_norm = torch.nn.BatchNorm1d(self._skill_dynamics_obs_dim, momentum=0.01, affine=False).to(self.device)
-            self._sd_input_batch_norm.eval()
-            self._sd_target_batch_norm.eval()
+        # if self._sd_batch_norm:
+        #     self._sd_input_batch_norm = torch.nn.BatchNorm1d(self._skill_dynamics_obs_dim, momentum=0.01).to(self.device)
+        #     self._sd_target_batch_norm = torch.nn.BatchNorm1d(self._skill_dynamics_obs_dim, momentum=0.01, affine=False).to(self.device)
+        #     self._sd_input_batch_norm.eval()
+        #     self._sd_target_batch_norm.eval()
 
         self._trans_minibatch_size = trans_minibatch_size
         self._trans_optimization_epochs = trans_optimization_epochs
@@ -439,8 +443,9 @@ class DRQ_METRAAgent:
 
         self._start_time = time.time()
         self.total_env_steps = 0
+        self.total_epoch = 0
 
-        self.rollout_worker = SkillRolloutWorker(self.seed, max_path_length=self.max_path_length, cur_extra_keys=['skill'])
+        self.rollout_worker = SkillRolloutWorker(self.seed, time_limit=self.time_limit, cur_extra_keys=['skill'])
 
     @property
     def policy(self):
@@ -503,10 +508,10 @@ class DRQ_METRAAgent:
             )
         print(f'_get_trajectories {time_get_trajectories[0]}s')
 
-        for traj in trajectories:
-            for key in ['ori_obs', 'next_ori_obs', 'coordinates', 'next_coordinates']:
-                if key not in traj['env_infos']:
-                    continue
+        # for traj in trajectories:
+        #     for key in ['ori_obs', 'next_ori_obs', 'coordinates', 'next_coordinates']:
+        #         if key not in traj['env_infos']:
+        #             continue
 
         return trajectories
 
@@ -516,7 +521,9 @@ class DRQ_METRAAgent:
             extra = extras[i]
             batch = self.rollout_worker.rollout(env, policy, extra, deterministic_policy=deterministic_policy)
             batches.append(batch)
-        return TrajectoryBatch.concatenate(*batches)
+        trajectories = TrajectoryBatch.concatenate(*batches)
+        paths = trajectories.to_trajectory_list()
+        return paths
 
     #########################################################################################################
     #                                                                                                       #
@@ -560,8 +567,10 @@ class DRQ_METRAAgent:
             data['rewards'].append(path['rewards'])
             data['dones'].append(path['dones'])
             data['returns'].append(utils.discount_cumsum(path['rewards'], self.discount))
-            data['ori_obs'].append(path['env_infos']['ori_obs'])
-            data['next_ori_obs'].append(path['env_infos']['next_ori_obs'])
+            # if 'ori_obs' in path['env_infos']:
+            #     data['ori_obs'].append(path['env_infos']['ori_obs'])
+            # if 'next_ori_obs' in path['env_infos']:
+            #     data['next_ori_obs'].append(path['env_infos']['next_ori_obs'])
             if 'pre_tanh_value' in path['agent_infos']:
                 data['pre_tanh_values'].append(path['agent_infos']['pre_tanh_value'])
             if 'log_prob' in path['agent_infos']:
@@ -600,44 +609,59 @@ class DRQ_METRAAgent:
     #########################################################################################################
     def train(self, n_epochs):
         last_return = None
-        self.total_epoch = 0
         with utils.GlobalContext({'phase': 'train', 'policy': 'sampling'}):
-            for self.total_epoch in tqdm.tqdm(n_epochs, desc=f'Training {self.name}'):
-                '''
-                full_tb_epochs=0,
-                log_period=self.n_epochs_per_log,
-                tb_period=self.n_epochs_per_tb,
-                pt_save_period=self.n_epochs_per_pt_save,
-                pkl_update_period=self.n_epochs_per_pkl_update,
-                new_save_period=self.n_epochs_per_save,
-                '''
-                for p in self.policy.values():
-                    p.eval()
-                self.traj_encoder.eval()
+            logger.log('Obtaining samples...')
+            for epoch in range(n_epochs):
+                with logger.prefix('epoch #%d | ' % epoch):
+                    self._itr_start_time = time.time()
+                    self.total_epoch = epoch
+                    '''
+                    full_tb_epochs=0,
+                    log_period=self.n_epochs_per_log,
+                    tb_period=self.n_epochs_per_tb,
+                    pt_save_period=self.n_epochs_per_pt_save,
+                    pkl_update_period=self.n_epochs_per_pkl_update,
+                    new_save_period=self.n_epochs_per_save,
+                    '''
+                    for p in self.policy.values():
+                        p.eval()
+                    self.traj_encoder.eval()
 
-                if self.n_epochs_per_eval != 0 and self.step_itr % self.n_epochs_per_eval == 0:
-                    self._evaluate_policy()
+                    if self.n_epochs_per_eval != 0 and self.step_itr % self.n_epochs_per_eval == 0:
+                        self._evaluate_policy()
 
-                for p in self.policy.values():
-                    p.train()
-                self.traj_encoder.train()
+                    for p in self.policy.values():
+                        p.train()
+                    self.traj_encoder.train()
 
-                for _ in range(self._num_train_per_epoch):
-                    time_sampling = [0.0]
-                    with MeasureAndAccTime(time_sampling):
-                        step_path = self._get_train_trajectories()
-                    self.total_env_steps += step_path.lengths.sum()
-                    last_return = self.train_once(
-                        self.step_itr,
-                        step_path,
-                        extra_scalar_metrics={
-                            'TimeSampling': time_sampling[0],
-                        },
-                    )
+                    for _ in range(self._num_train_per_epoch):
+                        time_sampling = [0.0]
+                        with MeasureAndAccTime(time_sampling):
+                            step_paths = self._get_train_trajectories()
+                        self.total_env_steps += sum([step_path['dones'].shape[0] for step_path in step_paths])
+                        last_return = self.train_once(
+                            self.step_itr,
+                            step_paths,
+                            extra_scalar_metrics={
+                                'TimeSampling': time_sampling[0],
+                            },
+                        )
 
-                self.step_itr += 1
+                    self.step_itr += 1
 
-                # TODO: logging
+                    # TODO: logging
+                    if self.enable_logging:
+                        if self.step_itr % self.n_epochs_per_log == 0:
+                            self.log_diagnostics(pause_for_plot=False)
+                            if self.n_epochs_per_tb is None:
+                                logger.dump_all(self.step_itr)
+                            else:
+                                if self.step_itr <= 0 or (self.n_epochs_per_tb != 0 and self.step_itr % self.n_epochs_per_tb == 0):
+                                    logger.dump_all(self.step_itr)
+                                else:
+                                    logger.dump_output_type((TextOutput, CsvOutput, StdOutput), self.step_itr)
+
+                        tabular.clear()
 
         return last_return
 
@@ -650,7 +674,7 @@ class DRQ_METRAAgent:
         time_training = [0.0]
 
         with MeasureAndAccTime(time_training):
-            tensors = self._train_once_inner(data)
+            metrics = self._train_once_inner(data)
 
         performence = utils.log_performance_ex(
             itr,
@@ -670,11 +694,11 @@ class DRQ_METRAAgent:
                 def _record_histogram(key, val):
                     utils.get_tabular('plot').record(key, Histogram(val))
 
-                for k in tensors.keys():
-                    if tensors[k].numel() == 1:
-                        _record_scalar(f'{k}', tensors[k].item())
+                for k in metrics.keys():
+                    if metrics[k].numel() == 1:
+                        _record_scalar(f'{k}', metrics[k].item())
                     else:
-                        _record_scalar(f'{k}', np.array2string(tensors[k].detach().cpu().numpy(), suppress_small=True))
+                        _record_scalar(f'{k}', np.array2string(metrics[k].detach().cpu().numpy(), suppress_small=True))
                 with torch.no_grad():
                     total_norm = compute_total_norm(self.all_parameters())
                     _record_scalar('TotalGradNormAll', total_norm.item())
@@ -704,76 +728,76 @@ class DRQ_METRAAgent:
 
         epoch_data = self._flatten_data(path_data)
 
-        tensors = self._train_components(epoch_data)
+        metrics = self._train_components(epoch_data)
 
-        return tensors
+        return metrics
 
     def _train_components(self, epoch_data):
         if self.replay_buffer is not None and self.replay_buffer.n_transitions_stored < self.min_buffer_size:
             return {}
 
         for _ in range(self._trans_optimization_epochs):
-            tensors = {}
+            metrics = {}
 
             if self.replay_buffer is None: # on policy training
                 v = self._get_mini_tensors(epoch_data)
             else: # off policy training
                 v = self._sample_replay_buffer()
 
-            self._optimize_te(tensors, v)
-            self._update_rewards(tensors, v)
-            self._optimize_op(tensors, v)
+            self._optimize_te(metrics, v)
+            self._update_rewards(metrics, v)
+            self._optimize_op(metrics, v)
 
-        return tensors
+        return metrics
     
     def _gradient_descent(self, loss, optimizer_keys):
         self._optimizer.zero_grad(keys=optimizer_keys)
         loss.backward()
         self._optimizer.step(keys=optimizer_keys)
 
-    def _optimize_te(self, tensors, internal_vars):
-        self._update_loss_te(tensors, internal_vars)
+    def _optimize_te(self, metrics, internal_vars):
+        self._update_loss_te(metrics, internal_vars)
 
         self._gradient_descent(
-            tensors['LossTe'],
+            metrics['LossTe'],
             optimizer_keys=['traj_encoder'],
         )
 
         if self.dual_reg:
-            self._update_loss_dual_lam(tensors, internal_vars)
+            self._update_loss_dual_lam(metrics, internal_vars)
             self._gradient_descent(
-                tensors['LossDualLam'],
+                metrics['LossDualLam'],
                 optimizer_keys=['dual_lam'],
             )
             if self.dual_dist == 's2_from_s':
                 self._gradient_descent(
-                    tensors['LossDp'],
+                    metrics['LossDp'],
                     optimizer_keys=['dist_predictor'],
                 )
 
-    def _optimize_op(self, tensors, internal_vars):
-        self._update_loss_qf(tensors, internal_vars)
+    def _optimize_op(self, metrics, internal_vars):
+        self._update_loss_qf(metrics, internal_vars)
 
         self._gradient_descent(
-            tensors['LossQf1'] + tensors['LossQf2'],
+            metrics['LossQf1'] + metrics['LossQf2'],
             optimizer_keys=['qf'],
         )
 
-        self._update_loss_op(tensors, internal_vars)
+        self._update_loss_op(metrics, internal_vars)
         self._gradient_descent(
-            tensors['LossSacp'],
+            metrics['LossSacp'],
             optimizer_keys=['skill_policy'],
         )
 
-        self._update_loss_alpha(tensors, internal_vars)
+        self._update_loss_alpha(metrics, internal_vars)
         self._gradient_descent(
-            tensors['LossAlpha'],
+            metrics['LossAlpha'],
             optimizer_keys=['log_alpha'],
         )
 
         sac_utils.update_targets(self)
 
-    def _update_rewards(self, tensors, v):
+    def _update_rewards(self, metrics, v):
         obs = v['obs']
         next_obs = v['next_obs']
 
@@ -803,15 +827,15 @@ class DRQ_METRAAgent:
             else:
                 rewards = target_dists.log_prob(v['skills'])
 
-        tensors.update({
+        metrics.update({
             'PureRewardMean': rewards.mean(),
             'PureRewardStd': rewards.std(),
         })
 
         v['rewards'] = rewards
 
-    def _update_loss_te(self, tensors, v):
-        self._update_rewards(tensors, v)
+    def _update_loss_te(self, metrics, v):
+        self._update_rewards(metrics, v)
         rewards = v['rewards']
 
         obs = v['obs']
@@ -820,7 +844,7 @@ class DRQ_METRAAgent:
         if self.dual_dist == 's2_from_s':
             s2_dist = self.dist_predictor(obs)
             loss_dp = -s2_dist.log_prob(next_obs - obs).mean()
-            tensors.update({
+            metrics.update({
                 'LossDp': loss_dp,
             })
 
@@ -844,7 +868,7 @@ class DRQ_METRAAgent:
                 normalized_scaling_factor = (scaling_factor / geo_mean) ** 2
                 cst_dist = torch.mean(torch.square((y - x) - s2_dist_mean) * normalized_scaling_factor, dim=1)
 
-                tensors.update({
+                metrics.update({
                     'ScalingFactor': scaling_factor.mean(dim=0),
                     'NormalizedScalingFactor': normalized_scaling_factor.mean(dim=0),
                 })
@@ -858,7 +882,7 @@ class DRQ_METRAAgent:
             v.update({
                 'cst_penalty': cst_penalty
             })
-            tensors.update({
+            metrics.update({
                 'DualCstPenalty': cst_penalty.mean(),
             })
         else:
@@ -866,27 +890,27 @@ class DRQ_METRAAgent:
 
         loss_te = -te_obj.mean()
 
-        tensors.update({
+        metrics.update({
             'TeObjMean': te_obj.mean(),
             'LossTe': loss_te,
         })
 
-    def _update_loss_dual_lam(self, tensors, v):
+    def _update_loss_dual_lam(self, metrics, v):
         log_dual_lam = self.dual_lam.param
         dual_lam = log_dual_lam.exp()
         loss_dual_lam = log_dual_lam * (v['cst_penalty'].detach()).mean()
 
-        tensors.update({
+        metrics.update({
             'DualLam': dual_lam,
             'LossDualLam': loss_dual_lam,
         })
 
-    def _update_loss_qf(self, tensors, v):
+    def _update_loss_qf(self, metrics, v):
         processed_cat_obs = self._get_concat_obs(self.skill_policy.process_observations(v['obs']), v['skills'])
         next_processed_cat_obs = self._get_concat_obs(self.skill_policy.process_observations(v['next_obs']), v['next_skills'])
 
         sac_utils.update_loss_qf(
-            self, tensors, v,
+            self, metrics, v,
             obs=processed_cat_obs,
             actions=v['actions'],
             next_obs=next_processed_cat_obs,
@@ -900,17 +924,17 @@ class DRQ_METRAAgent:
             'next_processed_cat_obs': next_processed_cat_obs,
         })
 
-    def _update_loss_op(self, tensors, v):
+    def _update_loss_op(self, metrics, v):
         processed_cat_obs = self._get_concat_obs(self.skill_policy.process_observations(v['obs']), v['skills'])
         sac_utils.update_loss_sacp(
-            self, tensors, v,
+            self, metrics, v,
             obs=processed_cat_obs,
             policy=self.skill_policy,
         )
 
-    def _update_loss_alpha(self, tensors, v):
+    def _update_loss_alpha(self, metrics, v):
         sac_utils.update_loss_alpha(
-            self, tensors, v,
+            self, metrics, v,
         )
 
 
@@ -919,6 +943,37 @@ class DRQ_METRAAgent:
     #                                        logging and eval                                               #
     #                                                                                                       #
     #########################################################################################################
+    def setup_logger(self, log_dir):
+        tabular_log_file = os.path.join(log_dir, 'progress.csv')
+        text_log_file = os.path.join(log_dir, 'debug.log')
+        tb_dir = os.path.join(log_dir, 'tb')
+
+        tabular_log_file_eval = os.path.join(log_dir, 'progress_eval.csv')
+        text_log_file_eval = os.path.join(log_dir, 'debug_eval.log')
+        tb_dir_eval = os.path.join(log_dir, 'tb_eval')
+        tb_dir_plot = os.path.join(log_dir, 'tb_plot')
+
+        logger.add_output(dowel.TextOutput(text_log_file))
+        logger.add_output(dowel.CsvOutput(tabular_log_file))
+        logger.add_output(
+            dowel.TensorBoardOutput(tb_dir, x_axis='TotalEpoch'))
+        logger.add_output(dowel.StdOutput())
+
+        dowel_eval = utils.get_dowel('eval')
+        logger_eval = dowel_eval.logger
+        logger_eval.add_output(dowel_eval.TextOutput(text_log_file_eval))
+        logger_eval.add_output(dowel_eval.CsvOutput(tabular_log_file_eval))
+        logger_eval.add_output(
+            dowel_eval.TensorBoardOutput(tb_dir_eval, x_axis='TotalEpoch'))
+        logger_eval.add_output(dowel_eval.StdOutput())
+
+        dowel_plot = utils.get_dowel('plot')
+        logger_plot = dowel_plot.logger
+        logger_plot.add_output(
+            dowel_plot.TensorBoardOutput(tb_dir_plot, x_axis='TotalEpoch'))
+
+        logger.log('Logging to {}'.format(log_dir))
+
     def _evaluate_policy(self):
         if self.discrete:
             eye_skills = np.eye(self.dim_skill)
@@ -949,10 +1004,11 @@ class DRQ_METRAAgent:
             deterministic_policy=True,
         )
 
-        with utils.FigManager(self.snapshot_dir, self.step_itr, 'TrajPlot_RandomZ') as fm:
-            self._env.render_trajectories( # TODO:
-                random_trajectories, random_skill_colors, self.eval_plot_axis, fm.ax
-            )
+        if False: # TODO:
+            with utils.FigManager(self.snapshot_dir, self.step_itr, 'TrajPlot_RandomZ') as fm:
+                self._env.render_trajectories(
+                    random_trajectories, random_skill_colors, self.eval_plot_axis, fm.ax
+                )
 
         data = self.process_samples(random_trajectories)
         last_obs = torch.stack([torch.from_numpy(ob[-1]).to(self.device) for ob in data['obs']])
@@ -967,7 +1023,7 @@ class DRQ_METRAAgent:
 
         skill_colors = random_skill_colors
 
-        with utils.FigManager(self.snapshot_dir, self.step_itr, f'PhiPlot') as fm:
+        with utils.FigManager(self.snapshot_dir, self.step_itr, f'PhiPlot') as fm: # PhiPlot just plots ϕ(s). The phi trajectories in the paper are also ϕ(s) trajectories from randomly sampled z's.
             utils.draw_2d_gaussians(skill_means, skill_stddevs, skill_colors, fm.ax)
             utils.draw_2d_gaussians(
                 skill_samples,
@@ -1001,16 +1057,13 @@ class DRQ_METRAAgent:
                         video_skills = video_skills / np.linalg.norm(video_skills, axis=1, keepdims=True)
                 video_skills = video_skills.repeat(self.num_video_repeats, axis=0)
             video_trajectories = self._get_trajectories(
-                sampler_key='local_skill_policy',
+                batch_size=len(video_skills),
+                deterministic_policy=True,
                 extras=self._generate_skill_extras(video_skills),
-                worker_update=dict(
-                    _render=True,
-                    _deterministic_policy=True,
-                ),
             )
             utils.record_video(self.snapshot_dir, self.step_itr, 'Video_RandomZ', video_trajectories, skip_frames=self.video_skip_frames)
 
-        eval_skill_metrics.update(self._env.calc_eval_metrics(random_trajectories, is_skill_trajectories=True)) # TODO:
+        eval_skill_metrics.update(self.calc_eval_metrics(random_trajectories, is_skill_trajectories=True))
         with utils.GlobalContext({'phase': 'eval', 'policy': 'skill'}):
             utils.log_performance_ex(
                 self.step_itr,
@@ -1020,7 +1073,26 @@ class DRQ_METRAAgent:
             )
         self._log_eval_metrics()
 
+    def calc_eval_metrics(self, trajectories, is_skill_trajectories=True):
+        eval_metrics = {}
+        sum_returns = 0
+        for traj in trajectories:
+            sum_returns += traj['rewards'].sum()
+        eval_metrics[f'ReturnOverall'] = sum_returns
+
+        return eval_metrics
     
+    def log_diagnostics(self, pause_for_plot=False):
+        total_time = (time.time() - self._start_time)
+        logger.log('Time %.2f s' % total_time)
+        epoch_time = (time.time() - self._itr_start_time)
+        logger.log('EpochTime %.2f s' % epoch_time)
+        tabular.record('TotalEnvSteps', self.total_env_steps)
+        tabular.record('TotalEpoch', self.total_epoch)
+        tabular.record('TimeEpoch', epoch_time)
+        tabular.record('TimeTotal', total_time)
+        logger.log(tabular)
+
     def _log_eval_metrics(self):
         self.eval_log_diagnostics()
         self.plot_log_diagnostics()

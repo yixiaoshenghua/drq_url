@@ -211,8 +211,8 @@ def get_torch_concat_obs(obs, skill, dim=1):
     concat_obs = torch.cat([obs] + [skill], dim=dim)
     return concat_obs
 
-def get_np_concat_obs(obs, option):
-    concat_obs = np.concatenate([obs] + [option])
+def get_np_concat_obs(obs, skill):
+    concat_obs = np.concatenate([obs] + [skill])
     return concat_obs
 
 def soft_update_params(net, target_net, tau):
@@ -401,9 +401,9 @@ def prepare_video(v, n_cols=None):
             (v, np.zeros(shape=(len_addition, t, c, h, w))), axis=0)
     n_rows = v.shape[0] // n_cols
 
-    v = np.reshape(v, newshape=(n_rows, n_cols, t, c, h, w))
-    v = np.transpose(v, axes=(2, 0, 4, 1, 5, 3))
-    v = np.reshape(v, newshape=(t, n_rows * h, n_cols * w, c))
+    v = v.reshape((n_rows, n_cols, t, c, h, w))
+    v = v.transpose((2, 0, 4, 1, 5, 3))
+    v = v.reshape((t, n_rows * h, n_cols * w, c))
 
     return v
 
@@ -432,10 +432,10 @@ def save_video(snapshot_dir, step_itr, label, tensor, fps=15, n_cols=None):
     clip.write_videofile(str(plot_path), audio=False, verbose=False, logger=None)
 
 
-def record_video(snapshot_dir, step_itr, label, trajectories, n_cols=None, skip_frames=1):
+def record_video(snapshot_dir, step_itr, label, trajectories, n_cols=None, skip_frames=1, shape=(64, 64)):
     renders = []
     for trajectory in trajectories:
-        render = trajectory['env_infos']['render']
+        render = trajectory['observations']
         if render.ndim >= 5:
             render = render.reshape(-1, *render.shape[-3:])
         elif render.ndim == 1:
@@ -446,36 +446,9 @@ def record_video(snapshot_dir, step_itr, label, trajectories, n_cols=None, skip_
         renders[i] = np.concatenate([render, np.zeros((max_length - render.shape[0], *render.shape[1:]), dtype=render.dtype)], axis=0)
         renders[i] = renders[i][::skip_frames]
     renders = np.array(renders)
+    renders = renders.reshape((renders.shape[0], renders.shape[1], *shape, -1)).transpose((0, 1, 4, 2, 3)) # (N, T, C, H, W)
     save_video(snapshot_dir, step_itr, label, renders, n_cols=n_cols)
 
-
-class FrameStack(gym.Wrapper):
-    def __init__(self, env, k):
-        gym.Wrapper.__init__(self, env)
-        self._k = k
-        self._frames = deque([], maxlen=k)
-        shp = env.observation_space.shape
-        self.observation_space = gym.spaces.Box(
-            low=0,
-            high=1,
-            shape=((shp[0] * k,) + shp[1:]),
-            dtype=env.observation_space.dtype)
-        self._max_episode_steps = env._max_episode_steps
-
-    def reset(self):
-        obs = self.env.reset()
-        for _ in range(self._k):
-            self._frames.append(obs)
-        return self._get_obs()
-
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        self._frames.append(obs)
-        return self._get_obs(), reward, done, info
-
-    def _get_obs(self):
-        assert len(self._frames) == self._k
-        return np.concatenate(list(self._frames), axis=0)
 
 
 class TanhTransform(pyd.transforms.Transform):
@@ -821,12 +794,12 @@ def explained_variance_1d(ypred, y, valids=None):
 
     Args:
         ypred (np.ndarray): Sample data from the first variable.
-            Shape: :math:`(N, max_path_length)`.
+            Shape: :math:`(N, time_limit)`.
         y (np.ndarray): Sample data from the second variable.
-            Shape: :math:`(N, max_path_length)`.
+            Shape: :math:`(N, time_limit)`.
         valids (np.ndarray): Optional argument. Array indicating valid indices.
             If None, it assumes the entire input array are valid.
-            Shape: :math:`(N, max_path_length)`.
+            Shape: :math:`(N, time_limit)`.
 
     Returns:
         float: The explained variance.

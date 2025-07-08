@@ -31,6 +31,27 @@ def get_sinusoidal_positional_encoding(max_length, d_model=512):
     
     return positional_encoding
 
+class Box(gym.spaces.Box):
+    """A Box space with a custom `flat_dim` property."""
+    @property
+    def flat_dim(self):
+        """Return the flattened dimension of the box."""
+        return int(np.prod(self.shape))
+    
+class EnvSpec:
+    """A class to hold environment specifications."""
+    def __init__(self, obs_space, act_space):
+        self.obs_space = obs_space
+        self.act_space = act_space
+
+    @property
+    def observation_space(self):
+        return self.obs_space["image"]
+
+    @property
+    def action_space(self):
+        return self.act_space["action"]
+
 class GymWrapper:
 
     def __init__(self, env, obs_key="image", act_key="action"):
@@ -316,42 +337,76 @@ class ViClipWrapper:
         return getattr(self._env, name)
 
 
-class Dummy:
+class DummyEnv:
 
-    def __init__(self):
-        pass
+    def __init__(self, name="dummy", seed=None, action_repeat=1, size=(64, 64), flatten_obs=False):
+        self.name = name
+        self.seed = seed
+        self.action_repeat = action_repeat
+        self._size = size
+        self.flatten_obs = flatten_obs
 
     @property
     def obs_space(self):
         return {
-            "image": gym.spaces.Box(0, 255, (64, 64, 3), dtype=np.uint8),
+            "image": Box(0, 255, (64, 64, 3), dtype=np.uint8),
             "reward": gym.spaces.Box(-np.inf, np.inf, (), dtype=np.float32),
             "is_first": gym.spaces.Box(0, 1, (), dtype=bool),
             "is_last": gym.spaces.Box(0, 1, (), dtype=bool),
             "is_terminal": gym.spaces.Box(0, 1, (), dtype=bool),
+            "success": gym.spaces.Box(0, 1, (), dtype=bool),
+            "info": dict(),
         }
 
     @property
     def act_space(self):
-        return {"action": gym.spaces.Box(-1, 1, (6,), dtype=np.float32)}
+        return {"action": Box(-1, 1, (6,), dtype=np.float32)}
+
+    @property
+    def spec(self):
+        return EnvSpec(
+            obs_space=self.obs_space,
+            act_space=self.act_space
+        )
 
     def step(self, action):
         return {
-            "image": np.zeros((64, 64, 3)),
+            "image": self._process_image(self.get_obs()),
             "reward": 0.0,
             "is_first": False,
             "is_last": False,
             "is_terminal": False,
+            "success": False,
+            "info": dict(),
         }
 
     def reset(self):
         return {
-            "image": np.zeros((64, 64, 3)),
+            "image": self._process_image(self.get_obs()),
             "reward": 0.0,
             "is_first": True,
             "is_last": False,
             "is_terminal": False,
+            "success": False,
+            "info": dict(),
         }
+    
+    def get_obs(self):
+        return np.random.randint(0, 255, (64, 64, 3), np.uint8)
+
+    def _process_image(self, obs):
+        """处理并调整图像大小"""
+
+        obs = self._resize_image(obs)
+        if self.flatten_obs:
+            obs = obs.flatten()
+        return obs
+
+    def _resize_image(self, img):
+        """调整图像大小并转换颜色格式"""
+        # 注意: OpenCV 使用 (宽, 高) 而 numpy 数组是 (高, 宽)
+        resized = cv2.resize(img, (self._size[1], self._size[0]))
+        return resized
 
 
 class TimeLimit:
@@ -390,6 +445,13 @@ class TimeLimit:
     @property
     def act_space(self):
         return self._env.act_space
+    
+    @property
+    def spec(self):
+        return EnvSpec(
+            obs_space=self.obs_space,
+            act_space=self.act_space
+        )
 
 
 class NormalizeAction:
@@ -414,7 +476,7 @@ class NormalizeAction:
     def act_space(self):
         low = np.where(self._mask, -np.ones_like(self._low), self._low)
         high = np.where(self._mask, np.ones_like(self._low), self._high)
-        space = gym.spaces.Box(low, high, dtype=np.float32)
+        space = Box(low, high, dtype=np.float32)
         return {**self._env.act_space, self._key: space}
 
     def step(self, action):
@@ -426,7 +488,12 @@ class NormalizeAction:
     def obs_space(self):
         return self._env.obs_space
 
-
+    @property
+    def spec(self):
+        return EnvSpec(
+            obs_space=self.obs_space,
+            act_space=self.act_space
+        )
 
 class OneHotAction:
 
@@ -451,7 +518,7 @@ class OneHotAction:
     @property
     def act_space(self):
         shape = (self._env.act_space[self._key].n,)
-        space = gym.spaces.Box(low=0, high=1, shape=shape, dtype=np.float32)
+        space = Box(low=0, high=1, shape=shape, dtype=np.float32)
         space.sample = self._sample_action
         space.n = shape[0]
         return {**self._env.act_space, self._key: space}
@@ -473,6 +540,13 @@ class OneHotAction:
         reference = np.zeros(actions, dtype=np.float32)
         reference[index] = 1.0
         return reference
+    
+    @property
+    def spec(self):
+        return EnvSpec(
+            obs_space=self.obs_space,
+            act_space=self.act_space
+        )
 
 class MultiDiscreteAction:
 
@@ -494,11 +568,17 @@ class MultiDiscreteAction:
     def obs_space(self):
         return self._env.obs_space
 
+    @property
+    def spec(self):
+        return EnvSpec(
+            obs_space=self.obs_space,
+            act_space=self.act_space
+        )
 
     @property
     def act_space(self):
         shape = self._env.act_space[self._key].nvec
-        space = gym.spaces.Box(low=0, high=1, shape=(int(shape.sum()), ), dtype=np.float32)
+        space = Box(low=0, high=1, shape=(int(shape.sum()), ), dtype=np.float32)
         space.nvec = shape
         return {**self._env.act_space, self._key: space}
 
@@ -548,12 +628,19 @@ class ResizeImage:
         spaces = self._env.obs_space
         for key in self._keys:
             shape = self._size + spaces[key].shape[2:]
-            spaces[key] = gym.spaces.Box(0, 255, shape, np.uint8)
+            spaces[key] = Box(0, 255, shape, np.uint8)
         return spaces
     
     @property
     def act_space(self):
         return self._env.act_space
+    
+    @property
+    def spec(self):
+        return EnvSpec(
+            obs_space=self.obs_space,
+            act_space=self.act_space
+        )
 
     def step(self, action):
         obs = self._env.step(action)
@@ -592,12 +679,19 @@ class RenderImage:
     @property
     def obs_space(self):
         spaces = self._env.obs_space
-        spaces[self._key] = gym.spaces.Box(0, 255, self._shape, np.uint8)
+        spaces[self._key] = Box(0, 255, self._shape, np.uint8)
         return spaces
     
     @property
     def act_space(self):
         return self._env.act_space
+    
+    @property
+    def spec(self):
+        return EnvSpec(
+            obs_space=self.obs_space,
+            act_space=self.act_space
+        )
 
     def step(self, action):
         obs = self._env.step(action)
@@ -629,13 +723,20 @@ class FrameStack:
     def obs_space(self):
         spaces = self._env.obs_space
         shp = spaces["image"].shape
-        spaces[self._key] = gym.spaces.Box(0, 255, (shp[:-1] + (shp[-1] * self._k,)), np.uint8)
+        spaces[self._key] = Box(0, 255, (shp[:-1] + (shp[-1] * self._k,)), np.uint8)
         return spaces
     
 
     @property
     def act_space(self):
         return self._env.act_space
+    
+    @property
+    def spec(self):
+        return EnvSpec(
+            obs_space=self.obs_space,
+            act_space=self.act_space
+        )
 
     def reset(self):
         timestep = self._env.reset()

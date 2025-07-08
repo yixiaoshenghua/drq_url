@@ -4,7 +4,10 @@ import os
 import pickle as pkl
 import sys
 import time
-
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message='ing')
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,9 +31,14 @@ import metra # Import drq directly for DRQ_METRAAgent
 import json
 from envs import make_env
 
+
 torch.backends.cudnn.benchmark = True
 
-# TODO:
+'''
+# METRA on pixel-based car racing for debug
+python train_drq_metra.py --task debug_dummy --time_limit 50 --seed 0 --traj_batch_size 8 --video_skip_frames 2 --framestack 3 --sac_min_buffer_size 300 --eval_plot_axis -15 15 -15 15 --algo metra --trans_optimization_epochs 2 --n_epochs_per_log 5 --n_epochs_per_eval 5 --n_epochs_per_save 1 --n_epochs_per_pt_save 1 --discrete 0 --dim_skill 4 --encoder 1 --sample_cpu 0 --action_repeat 1 --n_epochs 10
+'''
+
 class Workspace(object):
     """
     Manages the training and evaluation lifecycle for the DrQ(+METRA) agent.
@@ -40,7 +48,7 @@ class Workspace(object):
     def __init__(self, args):
         self.args = args
         # Create working directory for logs and outputs
-        self.work_dir = f'./runs/{args.task}/{time.strftime("%Y%m%d-%H%M%S")}_seed{args.seed}'
+        self.work_dir = f'./runs/{args.algo}-{args.task}/{time.strftime("%Y%m%d-%H%M%S")}_seed{args.seed}'
         os.makedirs(self.work_dir, exist_ok=True)
         os.makedirs(self.work_dir + '/models', exist_ok=True)
         print(f'Workspace directory: {self.work_dir}')
@@ -48,7 +56,7 @@ class Workspace(object):
             json.dump(vars(args), f, sort_keys=True, indent=4)
 
         utils.set_seed_everywhere(args.seed) # Set random seeds for reproducibility
-        self.device = torch.device(args.device) # Set device (cuda/cpu)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # Set device (cuda/cpu)
         self.env = make_env(mode="train", config=args) # Create the DMC environment
 
         # Determine camera_id for VideoRecorder based on environment
@@ -79,7 +87,7 @@ class Workspace(object):
                 dist_predictor=None,
                 dual_lam=args.dual_lam,
                 alpha=args.alpha,
-                max_path_length=args.max_path_length,
+                time_limit=args.time_limit,
                 n_epochs_per_eval=args.n_epochs_per_eval,
                 n_epochs_per_log=args.n_epochs_per_log,
                 n_epochs_per_tb=args.n_epochs_per_log,
@@ -96,8 +104,8 @@ class Workspace(object):
                 device=self.device,
                 sample_cpu=args.sample_cpu,
                 num_train_per_epoch=1,
-                sd_batch_norm=args.sd_batch_norm,
-                skill_dynamics_obs_dim=self.env.spec.observation_space.flat_dim,
+                sd_batch_norm=args.sd_batch_norm, # True, no use
+                skill_dynamics_obs_dim=self.env.spec.observation_space.flat_dim, # no use
                 trans_minibatch_size=args.trans_minibatch_size,
                 trans_optimization_epochs=args.trans_optimization_epochs,
                 discount=args.sac_discount,
@@ -119,12 +127,13 @@ class Workspace(object):
             )
         # Instantiate DRQ_METRAAgent with parameters derived from args
         self.agent = metra.DRQ_METRAAgent(**agent_params)
+        self.agent.setup_logger(self.work_dir)  # Setup logging for the agent
 
     def run(self):
         """Main training loop."""
         self.agent.train(n_epochs=self.args.n_epochs)  # Start training the agent
 
-        # save final model
+        # TODO: save final model
         self.agent.save(self.work_dir + '/models/final_model.pt')
 
 def get_argparser():
@@ -134,9 +143,12 @@ def get_argparser():
     parser.add_argument('--normalizer_type', type=str, default='off', choices=['off', 'preset'])
     parser.add_argument('--encoder', type=int, default=1)
     parser.add_argument('--task', type=str, default='dmc_walker_walk')
-    parser.add_argument('--frame_stack', type=int, default=None)
+    parser.add_argument('--framestack', type=int, default=None)
+    parser.add_argument('--action_repeat', type=int, default=1)
+    parser.add_argument('--render_size', type=int, default=64)
+    parser.add_argument('--flatten_obs', type=int, default=1, choices=[0, 1])
 
-    parser.add_argument('--max_path_length', type=int, default=200)
+    parser.add_argument('--time_limit', type=int, default=200)
 
     parser.add_argument('--use_gpu', type=int, default=1, choices=[0, 1])
     parser.add_argument('--sample_cpu', type=int, default=1, choices=[0, 1])

@@ -16,7 +16,7 @@ def _clip_actions(algo, actions):
 
 
 def update_loss_qf(
-        algo, tensors, v,
+        algo, metrics, v,
         obs,
         actions,
         next_obs,
@@ -53,7 +53,7 @@ def update_loss_qf(
     loss_qf1 = F.mse_loss(q1_pred, q_target) * 0.5
     loss_qf2 = F.mse_loss(q2_pred, q_target) * 0.5
 
-    tensors.update({
+    metrics.update({
         'QTargetsMean': q_target.mean(),
         'QTdErrsMean': ((q_target - q1_pred).mean() + (q_target - q2_pred).mean()) / 2,
         'LossQf1': loss_qf1,
@@ -62,7 +62,7 @@ def update_loss_qf(
 
 
 def update_loss_sacp(
-        algo, tensors, v,
+        algo, metrics, v,
         obs,
         policy,
 ):
@@ -85,7 +85,7 @@ def update_loss_sacp(
 
     loss_sacp = (alpha * new_action_log_probs - min_q_values).mean()
 
-    tensors.update({
+    metrics.update({
         'SacpNewActionLogProbMean': new_action_log_probs.mean(),
         'LossSacp': loss_sacp,
     })
@@ -96,13 +96,13 @@ def update_loss_sacp(
 
 
 def update_loss_alpha(
-        algo, tensors, v,
+        algo, metrics, v,
 ):
     loss_alpha = (-algo.log_alpha.param * (
             v['new_action_log_probs'].detach() + algo._target_entropy
     )).mean()
 
-    tensors.update({
+    metrics.update({
         'Alpha': algo.log_alpha.param.exp(),
         'LossAlpha': loss_alpha,
     })
