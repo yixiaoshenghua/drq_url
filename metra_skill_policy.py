@@ -1890,7 +1890,7 @@ class MetraAgent(torch.nn.Module):
 
     def assign_rewards(self, skill, obs, next_obs):
         """
-        Computes the METRA intrinsic reward: r_i = .
+        Computes the METRA intrinsic reward: r_i = [phi(s') - phi(s)]^T@z.
         Args:
             obs (torch.Tensor): Batch of observations (states), (bT, 9, 64, 64)
             skill (torch.Tensor): Batch of skills (actions/latents z), (bT, dim_skill)
@@ -1941,7 +1941,9 @@ class MetraAgent(torch.nn.Module):
 
 
 if __name__ == "__main__":
+    import random
     from video import RewardVideoRecorder
+    import cv2
     import utils
     from moviepy import editor as mpy
     from envs import make_env
@@ -1986,29 +1988,63 @@ if __name__ == "__main__":
     for skill_i, skill in enumerate(skills):
         # init env
         env_returns_for_curr_skill = []
-        int_returns_for_curr_skill = []
+        intrinsic_returns_for_curr_skill = []
+        # used for reward model verifying
+        obs_buffer = []
+        unpaired_returns_for_curr_skill = []
+        blured_returns_for_curr_skill = []
+        random_returns_for_curr_skill = []
         # 10 traj for each skill
         for traj_i in tqdm.tqdm(range(num_trajs)):
             i = 0
             obs = env.reset()
             env_rewards_for_curr_skill = []
-            int_rewards_for_curr_skill = []
+            intrinsic_rewards_for_curr_skill = []
+            # used for reward model verifying
+            unpaied_rewards_for_curr_skill = []
+            blured_rewards_for_curr_skill = []
+            random_rewards_for_curr_skill = []
             while not obs['is_terminal']:
+                # rollout the trajectory
                 prev_obs = obs
                 videos[i, 64*skill_i:64*(skill_i+1), 64*traj_i:64*(traj_i+1), :] = prev_obs['image'].reshape((64, 64, 9))[:, :, -3:]
                 action = skill_policy.choose_action(prev_obs['image'].reshape((1, -1)), skill.reshape((1, *skill.shape)))
                 obs = env.step({'action': action.ravel()})
                 env_rewards_for_curr_skill.append(obs['reward'])
-                int_reward = skill_policy.assign_rewards(skill.reshape((1, *skill.shape)), prev_obs['image'].reshape((1, -1)), obs['image'].reshape((1, -1)))
-                int_rewards_for_curr_skill.append(int_reward.item())
+                intrinsic_reward = skill_policy.assign_rewards(skill.reshape((1, *skill.shape)), prev_obs['image'].reshape((1, -1)), obs['image'].reshape((1, -1)))
+                intrinsic_rewards_for_curr_skill.append(intrinsic_reward.item())
+                # verified for the usefullness of the associated reward model
+                # reward for random noise
+                random_reward = skill_policy.assign_rewards(skill.reshape((1, *skill.shape)), prev_obs['image'].reshape((1, -1)), np.random.randint(0, 255, size=obs['image'].shape, dtype=np.uint8).reshape((1, -1)))
+                random_rewards_for_curr_skill.append(random_reward.item())
+                # reward for blured image
+                obs_images = obs['image'].reshape((64, 64, 9))
+                blured_obs = np.concatenate([cv2.GaussianBlur(image, (5, 5), 0) for image in [obs_images[:, :, :3], obs_images[:, :, -6:-3], obs_images[:, :, -3:]]], axis=-1)
+                blured_reward = skill_policy.assign_rewards(skill.reshape((1, *skill.shape)), prev_obs['image'].reshape((1, -1)), blured_obs.reshape((1, -1)))
+                blured_rewards_for_curr_skill.append(blured_reward.item())
+                # reward for unpaired image
+                obs_buffer.append(prev_obs['image'].reshape((1, -1)))
+                unpaired_obs = random.choice(obs_buffer)
+                unpaired_reward = skill_policy.assign_rewards(skill.reshape((1, *skill.shape)), prev_obs['image'].reshape((1, -1)), unpaired_obs)
+                unpaied_rewards_for_curr_skill.append(unpaired_reward.item())
+
+                # record the video
                 i += 1
             env_returns_for_curr_skill.append(np.sum(env_rewards_for_curr_skill))
-            int_returns_for_curr_skill.append(np.sum(int_rewards_for_curr_skill))
+            intrinsic_returns_for_curr_skill.append(np.sum(intrinsic_rewards_for_curr_skill))
+            unpaired_returns_for_curr_skill.append(np.sum(unpaied_rewards_for_curr_skill))
+            blured_returns_for_curr_skill.append(np.sum(blured_rewards_for_curr_skill))
+            random_returns_for_curr_skill.append(np.sum(random_rewards_for_curr_skill))
+
         
         # calculate the stats for each traj (mean / std)
-        print("Skill_id: {} | Intrinsic return mean: {:.1f}, std: {:.1f} | Env return mean: {:.1f}, std: {:.1f}".format(skill_i, np.mean(int_returns_for_curr_skill), np.std(int_returns_for_curr_skill), np.mean(env_returns_for_curr_skill), np.std(env_returns_for_curr_skill)))
+        print(f"Skill_id: {skill_i}\t"
+            f"| Intrinsic: \t{np.mean(intrinsic_returns_for_curr_skill):>12.1f} ± {np.std(intrinsic_returns_for_curr_skill):.1f}\t"
+            f"| Unpaired: \t{np.mean(unpaired_returns_for_curr_skill):>12.1f} ± {np.std(unpaired_returns_for_curr_skill):.1f}\t"
+            f"| Blured: \t{np.mean(blured_returns_for_curr_skill):>12.1f} ± {np.std(blured_returns_for_curr_skill):.1f}\t"
+            f"| Random: \t{np.mean(random_returns_for_curr_skill):>12.1f} ± {np.std(random_returns_for_curr_skill):.1f}\t"
+            f"| Env: \t{np.mean(env_returns_for_curr_skill):>12.1f} ± {np.std(env_returns_for_curr_skill):.1f}")
     # record videos (T, skills*height, 10*width, 3) with per-step reward
-    np.savez("videos.npz", videos=videos)
     clip = mpy.ImageSequenceClip(list(videos.astype(np.uint8)), fps=15)
     clip.write_videofile(f"test.mp4", audio=False, verbose=False, logger=None)
 
