@@ -103,6 +103,7 @@ class OptimizerGroupWrapper:
             for pg in self._optimizers[key].param_groups:
                 for p in pg['params']:
                     yield p
+
 class MeasureAndAccTime:
     def __init__(self, target):
         assert isinstance(target, list)
@@ -615,14 +616,7 @@ class DRQ_METRAAgent:
                 with logger.prefix('epoch #%d | ' % epoch):
                     self._itr_start_time = time.time()
                     self.total_epoch = epoch
-                    '''
-                    full_tb_epochs=0,
-                    log_period=self.n_epochs_per_log,
-                    tb_period=self.n_epochs_per_tb,
-                    pt_save_period=self.n_epochs_per_pt_save,
-                    pkl_update_period=self.n_epochs_per_pkl_update,
-                    new_save_period=self.n_epochs_per_save,
-                    '''
+
                     for p in self.policy.values():
                         p.eval()
                     self.traj_encoder.eval()
@@ -649,7 +643,11 @@ class DRQ_METRAAgent:
 
                     self.step_itr += 1
 
-                    # TODO: logging
+                    new_save = (self.n_epochs_per_save != 0 and self.step_itr % self.n_epochs_per_save == 0)
+                    pt_save = (self.n_epochs_per_pt_save != 0 and self.step_itr % self.n_epochs_per_pt_save == 0)
+                    if new_save or pt_save:
+                        self.save(epoch, new_save=new_save, pt_save=pt_save)
+
                     if self.enable_logging:
                         if self.step_itr % self.n_epochs_per_log == 0:
                             self.log_diagnostics(pause_for_plot=False)
@@ -734,6 +732,7 @@ class DRQ_METRAAgent:
 
     def _train_components(self, epoch_data):
         if self.replay_buffer is not None and self.replay_buffer.n_transitions_stored < self.min_buffer_size:
+            print(f"Current buffer size: {self.replay_buffer.n_transitions_stored}")
             return {}
 
         for _ in range(self._trans_optimization_epochs):
@@ -1112,3 +1111,47 @@ class DRQ_METRAAgent:
         utils.get_logger('plot').log(utils.get_tabular('plot'))
         utils.get_logger('plot').dump_all(self.step_itr)
         utils.get_tabular('plot').clear()
+
+    #########################################################################################################
+    #                                                                                                       #
+    #                                        save and restore model                                         #
+    #                                                                                                       #
+    #########################################################################################################
+    def save(self, epoch, new_save=False, pt_save=False):
+        """Save snapshot of current batch.
+
+        Args:
+            epoch (int): Epoch.
+
+        Raises:
+            NotSetupError: if save() is called before the runner is set up.
+
+        """
+
+        logger.log('Saving snapshot...')
+
+        if new_save and epoch != 0:
+            os.makedirs(os.path.join(self.snapshot_dir, f'models/epoch-{epoch}'), exist_ok=True)
+            file_name = os.path.join(self.snapshot_dir, f'models/epoch-{epoch}/skill_policy.pt')
+            torch.save({
+                'discrete': self.discrete,
+                'dim_skill': self.dim_skill,
+                'policy': self.skill_policy,
+            }, file_name)
+            file_name = os.path.join(self.snapshot_dir, f'models/epoch-{epoch}/traj_encoder.pt')
+            torch.save({
+                'discrete': self.discrete,
+                'dim_skill': self.dim_skill,
+                'traj_encoder': self.traj_encoder,
+            }, file_name)
+
+        if pt_save and epoch != 0:
+            os.makedirs(os.path.join(self.snapshot_dir, f'models/epoch-{epoch}'), exist_ok=True)
+            file_name = os.path.join(self.snapshot_dir, f'models/epoch-{epoch}/skill_policy.pt')
+            torch.save({
+                'discrete': self.discrete,
+                'dim_skill': self.dim_skill,
+                'policy': self.skill_policy,
+            }, file_name)
+
+        logger.log('Saved')

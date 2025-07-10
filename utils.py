@@ -1,6 +1,7 @@
 import math
 import os
 import random
+import cv2
 from collections import deque
 import pathlib
 import numpy as np
@@ -392,9 +393,9 @@ def prepare_video(v, n_cols=None):
         if v.shape[0] <= 3:
             n_cols = v.shape[0]
         elif v.shape[0] <= 9:
-            n_cols = 3
+            n_cols = 4
         else:
-            n_cols = 6
+            n_cols = 8
     if v.shape[0] % n_cols != 0:
         len_addition = n_cols - v.shape[0] % n_cols
         v = np.concatenate(
@@ -407,6 +408,23 @@ def prepare_video(v, n_cols=None):
 
     return v
 
+def save_tensor_to_mp4(video_tensor, output_path, fps=30):
+    T, H, W, C = video_tensor.shape
+    
+    if video_tensor.dtype != np.uint8:
+        video_tensor = (video_tensor * 255).astype(np.uint8)
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+    video_writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+    
+    if not video_writer.isOpened():
+        raise IOError("VideoWriter initialization failed!")
+    
+    for frame in video_tensor:
+        video_writer.write(frame)
+    
+    video_writer.release()
+    print(f"Video saved to {output_path}")
 
 def save_video(snapshot_dir, step_itr, label, tensor, fps=15, n_cols=None):
     def _to_uint8(t):
@@ -446,7 +464,7 @@ def record_video(snapshot_dir, step_itr, label, trajectories, n_cols=None, skip_
         renders[i] = np.concatenate([render, np.zeros((max_length - render.shape[0], *render.shape[1:]), dtype=render.dtype)], axis=0)
         renders[i] = renders[i][::skip_frames]
     renders = np.array(renders)
-    renders = renders.reshape((renders.shape[0], renders.shape[1], *shape, -1)).transpose((0, 1, 4, 2, 3)) # (N, T, C, H, W)
+    renders = renders.reshape((renders.shape[0], renders.shape[1], *shape, -1)).transpose((0, 1, 4, 2, 3))[:, :, -3:, :, :] # (N, T, C, H, W)
     save_video(snapshot_dir, step_itr, label, renders, n_cols=n_cols)
 
 

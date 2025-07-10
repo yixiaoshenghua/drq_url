@@ -103,3 +103,31 @@ class VideoRecorder(object):
                       f"dtype: {self.frames[0].dtype if self.frames else 'N/A'}")
             # Clear frames after saving to prepare for the next recording session
             self.frames = []
+
+
+
+class RewardVideoRecorder:
+    def __init__(self, root_dir, fps=20):
+        if root_dir is not None:
+            self.save_dir = root_dir / 'eval_video'
+            self.save_dir.mkdir(exist_ok=True)
+        else:
+            self.save_dir = None
+
+        self.fps = fps
+        self.frames = []
+
+    def init(self, frame, enabled=True):
+        self.frames = []
+        self.enabled = self.save_dir is not None and enabled
+        self.record(frame)
+
+    def record(self, frame, reward=None):
+            if reward is not None:
+                cv2.putText(frame, f'{reward:.2f}', (10, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+            self.frames.append(frame)
+
+    def save(self, file_name):
+        if self.enabled:
+            path = self.save_dir / file_name
+            imageio.mimsave(str(path), self.frames, fps=self.fps)

@@ -738,7 +738,7 @@ class PolicyEx(torch.nn.Module):
             akro.Space: Observation space.
 
         """
-        return self._env_spec.observation_space
+        return self.env_spec.observation_space
 
     @property
     def action_space(self):
@@ -748,7 +748,7 @@ class PolicyEx(torch.nn.Module):
             akro.Space: Action space.
 
         """
-        return self._env_spec.action_space
+        return self.env_spec.action_space
 
     def get_param_values(self):
         """Get the parameters to the policy.

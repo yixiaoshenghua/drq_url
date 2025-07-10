@@ -7,6 +7,7 @@ import time
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", message='ing')
 import numpy as np
 import torch
@@ -37,6 +38,7 @@ torch.backends.cudnn.benchmark = True
 '''
 # METRA on pixel-based car racing for debug
 python train_drq_metra.py --task debug_dummy --time_limit 50 --seed 0 --traj_batch_size 8 --video_skip_frames 2 --framestack 3 --sac_min_buffer_size 300 --eval_plot_axis -15 15 -15 15 --algo metra --trans_optimization_epochs 2 --n_epochs_per_log 5 --n_epochs_per_eval 5 --n_epochs_per_save 1 --n_epochs_per_pt_save 1 --discrete 0 --dim_skill 4 --encoder 1 --sample_cpu 0 --action_repeat 1 --n_epochs 10
+MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=0 python train_drq_metra.py --task metaworld_dial_turn --time_limit 250 --seed 0 --traj_batch_size 4 --video_skip_frames 4 --num_video_repeats 2 --framestack 3 --sac_max_buffer_size 100000 --eval_plot_axis -15 15 -15 15 --algo metra --trans_optimization_epochs 100 --n_epochs_per_log 10 --n_epochs_per_eval 2000 --n_epochs_per_save 10000 --n_epochs_per_pt_save 10000 --discrete 1 --dim_skill 8 --encoder 1 --sample_cpu 0 --action_repeat 1 --n_epochs 200000
 '''
 
 class Workspace(object):
@@ -48,7 +50,7 @@ class Workspace(object):
     def __init__(self, args):
         self.args = args
         # Create working directory for logs and outputs
-        self.work_dir = f'./runs/{args.algo}-{args.task}/{time.strftime("%Y%m%d-%H%M%S")}_seed{args.seed}'
+        self.work_dir = f'./runs/{args.algo}/{args.task}/{time.strftime("%Y%m%d-%H%M%S")}_seed{args.seed}'
         os.makedirs(self.work_dir, exist_ok=True)
         os.makedirs(self.work_dir + '/models', exist_ok=True)
         print(f'Workspace directory: {self.work_dir}')
@@ -58,9 +60,6 @@ class Workspace(object):
         utils.set_seed_everywhere(args.seed) # Set random seeds for reproducibility
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # Set device (cuda/cpu)
         self.env = make_env(mode="train", config=args) # Create the DMC environment
-
-        # Determine camera_id for VideoRecorder based on environment
-        camera_id = 2 if args.task.startswith('quadruped') else 0
 
         # Initialize Replay Buffer
         self.replay_buffer = PathBufferEx(capacity_in_transitions=int(args.sac_max_buffer_size), 
@@ -133,8 +132,7 @@ class Workspace(object):
         """Main training loop."""
         self.agent.train(n_epochs=self.args.n_epochs)  # Start training the agent
 
-        # TODO: save final model
-        self.agent.save(self.work_dir + '/models/final_model.pt')
+        self.agent.save(epoch='final', pt_save=True)
 
 def get_argparser():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -147,6 +145,8 @@ def get_argparser():
     parser.add_argument('--action_repeat', type=int, default=1)
     parser.add_argument('--render_size', type=int, default=64)
     parser.add_argument('--flatten_obs', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--camera', type=str, default='corner')
+    parser.add_argument('--dmc_camera', type=int, default=-1)
 
     parser.add_argument('--time_limit', type=int, default=200)
 

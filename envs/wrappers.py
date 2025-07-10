@@ -754,7 +754,10 @@ class FrameStack:
 
     def _get_obs(self):
         assert len(self._frames) == self._k
-        return np.concatenate(list(self._frames), axis=-1)
+        if len(self._frames[0].shape) < 3:
+            return np.concatenate([frame.reshape((1, *self._env.obs_space["image"].shape)) for frame in list(self._frames)], axis=-1).flatten()
+        else:
+            return np.concatenate(list(self._frames), axis=-1)
 
 
 class Async:

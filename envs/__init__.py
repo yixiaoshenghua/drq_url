@@ -1,13 +1,14 @@
 # from .carla import Carla
-# from .dmc import DMC, RandomVideoSource
-# from .dmc_remastered import DMCRemastered
-# from .metaworld import MetaWorld, ViewMetaWorld, MultiViewMetaWorld
+from .dmc import DMC, RandomVideoSource
+from .dmc_remastered import DMCRemastered
+from .metaworld import MetaWorld, ViewMetaWorld, MultiViewMetaWorld
 
-# from .robodesk import RoboDesk
+from .robodesk import RoboDesk
+from .gym_env import CarRacingEnv
 # # from .od_mujoco import OffDynamicsMujocoEnv
 # # from .od_envs import *
 # from .rlbench import RLBench
-# from .gym_env import CarRacingEnv
+
 # from .minecraft import Minecraft
 from .wrappers import *
 import warnings
