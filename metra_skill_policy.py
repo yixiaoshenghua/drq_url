@@ -27,7 +27,6 @@ from collections import namedtuple
 # import dmc2gym
 # import hydra # Hydra configuration is replaced by argparse
 import tqdm
-import utils
 import json
 
 
@@ -1059,7 +1058,7 @@ class GaussianMLPBaseModule(nn.Module):
         # wrapped by torch.distributions.Independent, then custom functions
         # such as rsample_with_pretanh_value of the TanhNormal distribution
         # are not accessable.
-        if not isinstance(dist, utils.TanhNormal):
+        if not isinstance(dist, TanhNormal):
             # Makes it so that a sample from the distribution is treated as a
             # single sample and not dist.batch_shape samples.
             dist = Independent(dist, 1)
@@ -1260,7 +1259,7 @@ class ForwardWithTransformTrait(object):
         # wrapped by torch.distributions.Independent, then custom functions
         # such as rsample_with_pre_tanh_value of the TanhNormal distribution
         # are not accessable.
-        if not isinstance(dist, utils.TanhNormal):
+        if not isinstance(dist, TanhNormal):
             # Makes it so that a sample from the distribution is treated as a
             # single sample and not dist.batch_shape samples.
             dist = Independent(dist, 1)
@@ -1273,7 +1272,7 @@ class ForwardWithTransformTrait(object):
         # wrapped by torch.distributions.Independent, then custom functions
         # such as rsample_with_pre_tanh_value of the TanhNormal distribution
         # are not accessable.
-        if not isinstance(dist_transformed, utils.TanhNormal):
+        if not isinstance(dist_transformed, TanhNormal):
             # Makes it so that a sample from the distribution is treated as a
             # single sample and not dist_transformed.batch_shape samples.
             dist_transformed = Independent(dist_transformed, 1)
@@ -1307,7 +1306,7 @@ class ForwardWithChunksTrait(object):
         # wrapped by torch.distributions.Independent, then custom functions
         # such as rsample_with_pretanh_value of the TanhNormal distribution
         # are not accessable.
-        if not isinstance(dist, utils.TanhNormal):
+        if not isinstance(dist, TanhNormal):
             # Makes it so that a sample from the distribution is treated as a
             # single sample and not dist.batch_shape samples.
             dist = Independent(dist, 1)
@@ -1335,7 +1334,7 @@ class ForwardModeTrait(object):
         # wrapped by torch.distributions.Independent, then custom functions
         # such as rsample_with_pre_tanh_value of the TanhNormal distribution
         # are not accessable.
-        if not isinstance(dist, utils.TanhNormal):
+        if not isinstance(dist, TanhNormal):
             # Makes it so that a sample from the distribution is treated as a
             # single sample and not dist.batch_shape samples.
             dist = Independent(dist, 1)
@@ -1815,7 +1814,7 @@ class MetraAgent(torch.nn.Module):
             if not isinstance(observations, torch.Tensor):
                 observations = torch.as_tensor(observations).float().to(next(self.parameters()).device)
             dist, info = self.forward(observations)
-            if isinstance(dist, utils.TanhNormal):
+            if isinstance(dist, TanhNormal):
                 pre_tanh_values, actions = dist.rsample_with_pre_tanh_value()
                 log_probs = dist.log_prob(actions, pre_tanh_values)
                 actions = actions.detach().cpu().numpy()
@@ -1942,6 +1941,9 @@ class MetraAgent(torch.nn.Module):
 
 
 if __name__ == "__main__":
+    from video import RewardVideoRecorder
+    import utils
+    from moviepy import editor as mpy
     from envs import make_env
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     args = json.load(open("runs/metra/metaworld_reach/20250709-014111_seed0/args.json", 'r'))
@@ -1978,15 +1980,37 @@ if __name__ == "__main__":
 
 
     # generate skills
-
-    # init env
-
-    # 10 traj for each skill
-
-    # calculate the stats for each traj (mean / std)
-
+    num_trajs = 10
+    skills = skill_policy.get_skills(args.dim_skill)
+    videos = np.zeros((args.time_limit, args.dim_skill*64, num_trajs*64, 3), dtype=np.uint8)
+    for skill_i, skill in enumerate(skills):
+        # init env
+        env_returns_for_curr_skill = []
+        int_returns_for_curr_skill = []
+        # 10 traj for each skill
+        for traj_i in tqdm.tqdm(range(num_trajs)):
+            i = 0
+            obs = env.reset()
+            env_rewards_for_curr_skill = []
+            int_rewards_for_curr_skill = []
+            while not obs['is_terminal']:
+                prev_obs = obs
+                videos[i, 64*skill_i:64*(skill_i+1), 64*traj_i:64*(traj_i+1), :] = prev_obs['image'].reshape((64, 64, 9))[:, :, -3:]
+                action = skill_policy.choose_action(prev_obs['image'].reshape((1, -1)), skill.reshape((1, *skill.shape)))
+                obs = env.step({'action': action.ravel()})
+                env_rewards_for_curr_skill.append(obs['reward'])
+                int_reward = skill_policy.assign_rewards(skill.reshape((1, *skill.shape)), prev_obs['image'].reshape((1, -1)), obs['image'].reshape((1, -1)))
+                int_rewards_for_curr_skill.append(int_reward.item())
+                i += 1
+            env_returns_for_curr_skill.append(np.sum(env_rewards_for_curr_skill))
+            int_returns_for_curr_skill.append(np.sum(int_rewards_for_curr_skill))
+        
+        # calculate the stats for each traj (mean / std)
+        print("Skill_id: {} | Intrinsic return mean: {:.1f}, std: {:.1f} | Env return mean: {:.1f}, std: {:.1f}".format(skill_i, np.mean(int_returns_for_curr_skill), np.std(int_returns_for_curr_skill), np.mean(env_returns_for_curr_skill), np.std(env_returns_for_curr_skill)))
     # record videos (T, skills*height, 10*width, 3) with per-step reward
-
+    np.savez("videos.npz", videos=videos)
+    clip = mpy.ImageSequenceClip(list(videos.astype(np.uint8)), fps=15)
+    clip.write_videofile(f"test.mp4", audio=False, verbose=False, logger=None)
 
 
 
