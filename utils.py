@@ -19,7 +19,6 @@ from torch.distributions import Normal
 from torch.distributions.independent import Independent
 from skimage.util.shape import view_as_windows
 from torch import distributions as pyd
-from dowel import Histogram
 import copy
 import sys
 
@@ -58,27 +57,8 @@ def get_context():
     global _g_context
     return copy.copy(_g_context)
 
-import dowel
-dowel_eval = dowel
-del sys.modules['dowel']
-
-import dowel
-dowel_plot = dowel
-del sys.modules['dowel']
-
-def get_dowel(phase=None):
-    if (phase or get_context().get('phase')).lower() == 'plot':
-        return dowel_plot
-    if (phase or get_context().get('phase')).lower() == 'eval':
-        return dowel_eval
-    return dowel
-def get_logger(phase=None):
-    return get_dowel(phase).logger
-def get_tabular(phase=None):
-    return get_dowel(phase).tabular
-
 class FigManager:
-    def __init__(self, snapshot_dir, step_itr, label, extensions=None, subplot_spec=None):
+    def __init__(self, snapshot_dir, step_itr, label, extensions=None, subplot_spec=None, writer=None, global_step=None):
         self.snapshot_dir = snapshot_dir
         self.step_itr = step_itr
         self.label = label
@@ -93,6 +73,9 @@ class FigManager:
         else:
             self.extensions = extensions
 
+        self.writer = writer
+        self.global_step = global_step
+
     def __enter__(self):
         return self
 
@@ -103,7 +86,8 @@ class FigManager:
         plot_paths[0].parent.mkdir(parents=True, exist_ok=True)
         for plot_path in plot_paths:
             self.fig.savefig(plot_path, dpi=300)
-        get_tabular('plot').record(self.label, self.fig)
+        if self.writer is not None and self.global_step is not None:
+            self.writer.add_figure(self.label, self.fig, self.global_step)
 
 class eval_mode(object):
     def __init__(self, *models):
@@ -147,7 +131,7 @@ def log_performance_ex(itr, batch, discount, additional_records=None, additional
         discount (float): Discount value, from algorithm's property.
 
     Returns:
-        numpy.ndarray: Undiscounted returns.
+        dict: Dictionary containing scalars and histograms.
 
     """
     if additional_records is None:
@@ -165,48 +149,49 @@ def log_performance_ex(itr, batch, discount, additional_records=None, additional
 
     average_discounted_return = np.mean([rtn[0] for rtn in returns])
 
-    prefix_tabular = get_metric_prefix()
-    with get_tabular().prefix(prefix_tabular):
-        def _record(key, val, pre=''):
-            get_tabular().record(
-                    (pre + '/' if len(pre) > 0 else '') + key,
-                    val)
+    prefix = get_metric_prefix()
+    metrics = {'scalars': {}, 'histograms': {}}
 
-        def _record_histogram(key, val):
-            get_tabular('plot').record(key, Histogram(val))
+    def _record(key, val, pre=''):
+        full_key = (pre + '/' if len(pre) > 0 else '') + key
+        metrics['scalars'][prefix + full_key] = val
 
-        _record('Iteration', itr)
-        get_tabular().record('Iteration', itr)
-        _record('NumTrajs', len(returns))
+    def _record_histogram(key, val):
+        metrics['histograms'][prefix + key] = val
 
-        max_undiscounted_returns = np.max(undiscounted_returns)
-        min_undiscounted_returns = np.min(undiscounted_returns)
-        _record('AverageDiscountedReturn', average_discounted_return)
-        _record('AverageReturn', np.mean(undiscounted_returns))
-        _record('StdReturn', np.std(undiscounted_returns))
-        _record('MaxReturn', max_undiscounted_returns)
-        _record('MinReturn', min_undiscounted_returns)
-        _record('DiffMaxMinReturn', max_undiscounted_returns - min_undiscounted_returns)
-        _record('CompletionRate', np.mean(completion))
-        if success:
-            _record('SuccessRate', np.mean(success))
+    _record('Iteration', itr)
+    _record('NumTrajs', len(returns))
 
-        for key, val in additional_records.items():
-            is_scalar = True
-            try:
-                if len(val) > 1:
-                    is_scalar = False
-            except TypeError:
-                pass
-            if is_scalar:
-                _record(key, val, pre=additional_prefix)
-            else:
-                _record_histogram(key, val)
+    max_undiscounted_returns = np.max(undiscounted_returns)
+    min_undiscounted_returns = np.min(undiscounted_returns)
+    _record('AverageDiscountedReturn', average_discounted_return)
+    _record('AverageReturn', np.mean(undiscounted_returns))
+    _record('StdReturn', np.std(undiscounted_returns))
+    _record('MaxReturn', max_undiscounted_returns)
+    _record('MinReturn', min_undiscounted_returns)
+    _record('DiffMaxMinReturn', max_undiscounted_returns - min_undiscounted_returns)
+    _record('CompletionRate', np.mean(completion))
+    if success:
+        _record('SuccessRate', np.mean(success))
 
-    return dict(
-        undiscounted_returns=undiscounted_returns,
-        discounted_returns=[rtn[0] for rtn in returns],
-    )
+    for key, val in additional_records.items():
+        is_scalar = True
+        try:
+            if len(val) > 1:
+                is_scalar = False
+        except TypeError:
+            pass
+        if is_scalar:
+            _record(key, val, pre=additional_prefix)
+        else:
+            _record_histogram(key, val)
+
+    return {
+        'scalars': metrics['scalars'],
+        'histograms': metrics['histograms'],
+        'undiscounted_returns': undiscounted_returns,
+        'discounted_returns': [rtn[0] for rtn in returns],
+    }
 
 def get_torch_concat_obs(obs, skill, dim=1):
     concat_obs = torch.cat([obs] + [skill], dim=dim)

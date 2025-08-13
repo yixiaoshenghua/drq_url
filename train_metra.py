@@ -25,9 +25,7 @@ import argparse
 # import hydra # Hydra configuration is replaced by argparse
 import tqdm
 import utils
-from logger import Logger # Handles logging to console, CSVs, and TensorBoard
 from replay_buffer import PathBufferEx
-from video import VideoRecorder
 import metra # Import drq directly for DRQ_METRAAgent
 import json
 from envs import make_env
@@ -37,8 +35,8 @@ torch.backends.cudnn.benchmark = True
 
 '''
 # METRA on pixel-based car racing for debug
-python train_drq_metra.py --task debug_dummy --time_limit 50 --seed 0 --traj_batch_size 8 --video_skip_frames 2 --framestack 3 --sac_min_buffer_size 300 --eval_plot_axis -15 15 -15 15 --algo metra --trans_optimization_epochs 2 --n_epochs_per_log 5 --n_epochs_per_eval 5 --n_epochs_per_save 1 --n_epochs_per_pt_save 1 --discrete 0 --dim_skill 4 --encoder 1 --sample_cpu 0 --action_repeat 1 --n_epochs 10
-MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=0 python train_drq_metra.py --task metaworld_dial_turn --time_limit 250 --seed 0 --traj_batch_size 4 --video_skip_frames 4 --num_video_repeats 2 --framestack 3 --sac_max_buffer_size 100000 --eval_plot_axis -15 15 -15 15 --algo metra --trans_optimization_epochs 100 --n_epochs_per_log 10 --n_epochs_per_eval 2000 --n_epochs_per_save 10000 --n_epochs_per_pt_save 10000 --discrete 1 --dim_skill 8 --encoder 1 --sample_cpu 0 --action_repeat 1 --n_epochs 200000
+python train_metra.py --task debug_dummy --time_limit 50 --seed 0 --traj_batch_size 8 --video_skip_frames 2 --framestack 3 --sac_min_buffer_size 300 --eval_plot_axis -15 15 -15 15 --algo metra --trans_optimization_epochs 2 --n_epochs_per_log 5 --n_epochs_per_eval 5 --n_epochs_per_save 1 --n_epochs_per_pt_save 1 --discrete 0 --dim_skill 4 --encoder 1 --sample_cpu 0 --action_repeat 1 --n_epochs 10
+MUJOCO_GL=egl CUDA_VISIBLE_DEVICES=0 python train_metra.py --task metaworld_dial_turn --time_limit 250 --seed 0 --traj_batch_size 4 --video_skip_frames 4 --num_video_repeats 2 --framestack 3 --sac_max_buffer_size 100000 --eval_plot_axis -15 15 -15 15 --algo metra --trans_optimization_epochs 100 --n_epochs_per_log 10 --n_epochs_per_eval 2000 --n_epochs_per_save 10000 --n_epochs_per_pt_save 10000 --discrete 1 --dim_skill 8 --encoder 1 --sample_cpu 0 --action_repeat 1 --n_epochs 200000
 '''
 
 class Workspace(object):

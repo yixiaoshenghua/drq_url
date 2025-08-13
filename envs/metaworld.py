@@ -98,7 +98,7 @@ class MetaWorld:
     def reset(self):
         if self._camera == "corner2":
             self._env.model.cam_pos[2][:] = [0.75, 0.075, 0.7]
-        state, info = self._env.reset()
+        self._env.reset()
         image = self.render()
         obs = {
             "reward": 0.0,
@@ -120,7 +120,7 @@ class MetaWorld:
         return obs
 
     def render(self, mode='offscreen'):
-        obs = cv2.resize(self._env.render()[::-1], self._size)
+        obs = cv2.resize(self._env.render(offscreen=True)[::-1], self._size)#  camera_name="corner2", resolution=(640, 480)
         if self.flatten_obs:
             obs = obs.flatten()
         return obs
@@ -204,7 +204,7 @@ class MultiViewMetaWorld:
         return obs
 
     def reset(self):
-        state, info = self._env.reset()
+        self._env.reset()
         image = self.render()
         obs = {
             "reward": 0.0,
@@ -416,7 +416,7 @@ class ViewMetaWorld:
     def reset(self):
         # if self._camera == "corner2":
         #     self._env.model.cam_pos[2][:] = [0.75, 0.075, 0.7]
-        state, info = self._env.reset()
+        self._env.reset()
         image = self.render()
         obs = {
             "reward": 0.0,

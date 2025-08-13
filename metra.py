@@ -8,13 +8,13 @@ import copy
 import math
 import time
 import utils
-import dowel
-from dowel import logger, tabular, Histogram, TextOutput, CsvOutput, StdOutput
-from replay_buffer import TrajectoryBatch, SkillRolloutWorker
-import sac_utils
 from collections import defaultdict
 import tqdm
 import functools
+from torch.utils.tensorboard import SummaryWriter
+import logging
+from replay_buffer import TrajectoryBatch, SkillRolloutWorker
+import sac_utils
 from networks import PolicyEx, ContinuousMLPQFunctionEx, GaussianMLPIndependentStdModuleEx, GaussianMLPTwoHeadedModuleEx, Encoder, WithEncoder
 
 class DictBatchDataset:
@@ -138,7 +138,7 @@ def _finalize_lr(lr, common_lr=1e-4):
     else:
         assert bool(lr), 'To specify a lr of 0, use a negative value'
     if lr < 0.0:
-        logger.log(f'Setting lr to ZERO given {lr}')
+        print(f'Setting lr to ZERO given {lr}')
         lr = 0.0
     return lr
 
@@ -448,6 +448,9 @@ class DRQ_METRAAgent:
 
         self.rollout_worker = SkillRolloutWorker(self.seed, time_limit=self.time_limit, cur_extra_keys=['skill'])
 
+        self.writer = None
+        self.logger = None
+
     @property
     def policy(self):
         return {
@@ -611,55 +614,53 @@ class DRQ_METRAAgent:
     def train(self, n_epochs):
         last_return = None
         with utils.GlobalContext({'phase': 'train', 'policy': 'sampling'}):
-            logger.log('Obtaining samples...')
+            self.logger.info('Obtaining samples...')
             for epoch in range(n_epochs):
-                with logger.prefix('epoch #%d | ' % epoch):
-                    self._itr_start_time = time.time()
-                    self.total_epoch = epoch
+                self.logger.info('epoch #%d | ' % epoch)
+                self._itr_start_time = time.time()
+                self.total_epoch = epoch
 
-                    for p in self.policy.values():
-                        p.eval()
-                    self.traj_encoder.eval()
+                for p in self.policy.values():
+                    p.eval()
+                self.traj_encoder.eval()
 
-                    if self.n_epochs_per_eval != 0 and self.step_itr % self.n_epochs_per_eval == 0:
-                        self._evaluate_policy()
+                if self.n_epochs_per_eval != 0 and self.step_itr % self.n_epochs_per_eval == 0:
+                    self._evaluate_policy()
 
-                    for p in self.policy.values():
-                        p.train()
-                    self.traj_encoder.train()
+                for p in self.policy.values():
+                    p.train()
+                self.traj_encoder.train()
 
-                    for _ in range(self._num_train_per_epoch):
-                        time_sampling = [0.0]
-                        with MeasureAndAccTime(time_sampling):
-                            step_paths = self._get_train_trajectories()
-                        self.total_env_steps += sum([step_path['dones'].shape[0] for step_path in step_paths])
-                        last_return = self.train_once(
-                            self.step_itr,
-                            step_paths,
-                            extra_scalar_metrics={
-                                'TimeSampling': time_sampling[0],
-                            },
-                        )
+                for _ in range(self._num_train_per_epoch):
+                    time_sampling = [0.0]
+                    with MeasureAndAccTime(time_sampling):
+                        step_paths = self._get_train_trajectories()
+                    self.total_env_steps += sum([step_path['dones'].shape[0] for step_path in step_paths])
+                    last_return = self.train_once(
+                        self.step_itr,
+                        step_paths,
+                        extra_scalar_metrics={
+                            'TimeSampling': time_sampling[0],
+                        },
+                    )
 
-                    self.step_itr += 1
+                self.step_itr += 1
 
-                    new_save = (self.n_epochs_per_save != 0 and self.step_itr % self.n_epochs_per_save == 0)
-                    pt_save = (self.n_epochs_per_pt_save != 0 and self.step_itr % self.n_epochs_per_pt_save == 0)
-                    if new_save or pt_save:
-                        self.save(epoch, new_save=new_save, pt_save=pt_save)
+                new_save = (self.n_epochs_per_save != 0 and self.step_itr % self.n_epochs_per_save == 0)
+                pt_save = (self.n_epochs_per_pt_save != 0 and self.step_itr % self.n_epochs_per_pt_save == 0)
+                if new_save or pt_save:
+                    self.save(epoch, new_save=new_save, pt_save=pt_save)
 
-                    if self.enable_logging:
-                        if self.step_itr % self.n_epochs_per_log == 0:
-                            self.log_diagnostics(pause_for_plot=False)
-                            if self.n_epochs_per_tb is None:
-                                logger.dump_all(self.step_itr)
+                if self.enable_logging:
+                    if self.step_itr % self.n_epochs_per_log == 0:
+                        self.log_diagnostics(pause_for_plot=False)
+                        if self.n_epochs_per_tb is None:
+                            self.writer.flush()
+                        else:
+                            if self.step_itr <= 0 or (self.n_epochs_per_tb != 0 and self.step_itr % self.n_epochs_per_tb == 0):
+                                self.writer.flush()
                             else:
-                                if self.step_itr <= 0 or (self.n_epochs_per_tb != 0 and self.step_itr % self.n_epochs_per_tb == 0):
-                                    logger.dump_all(self.step_itr)
-                                else:
-                                    logger.dump_output_type((TextOutput, CsvOutput, StdOutput), self.step_itr)
-
-                        tabular.clear()
+                                print('Dump text csv std at', self.step_itr)
 
         return last_return
 
@@ -674,50 +675,45 @@ class DRQ_METRAAgent:
         with MeasureAndAccTime(time_training):
             metrics = self._train_once_inner(data)
 
-        performence = utils.log_performance_ex(
+        performance = utils.log_performance_ex(
             itr,
             TrajectoryBatch.from_trajectory_list(self._env_spec, paths),
             discount=self.discount,
         )
-        discounted_returns = performence['discounted_returns']
-        undiscounted_returns = performence['undiscounted_returns']
+        discounted_returns = performance['discounted_returns']
+        undiscounted_returns = performance['undiscounted_returns']
+
+        prefix = utils.get_metric_prefix() + self.name + '/'
+        self.writer.add_scalar(prefix + 'AverageDiscountedReturn', np.mean(discounted_returns), self.step_itr)
+        self.writer.add_scalar(prefix + 'AverageReturn', np.mean(undiscounted_returns), self.step_itr)
 
         if logging_enabled:
-            prefix_tabular = utils.get_metric_prefix()
-            with utils.get_tabular().prefix(prefix_tabular + self.name + '/'), utils.get_tabular(
-                    'plot').prefix(prefix_tabular + self.name + '/'):
-                def _record_scalar(key, val):
-                    utils.get_tabular().record(key, val)
+            for k in metrics.keys():
+                if metrics[k].numel() == 1:
+                    self.writer.add_scalar(prefix + f'{k}', metrics[k].item(), self.step_itr)
+                else:
+                    self.writer.add_scalar(prefix + f'{k}', metrics[k].mean(), self.step_itr)  # Use mean for arrays
+            with torch.no_grad():
+                total_norm = compute_total_norm(self.all_parameters())
+                self.writer.add_scalar(prefix + 'TotalGradNormAll', total_norm.item(), self.step_itr)
+                for key, module in self.param_modules.items():
+                    total_norm = compute_total_norm(module.parameters())
+                    self.writer.add_scalar(prefix + f'TotalGradNorm{key.replace("_", " ").title().replace(" ", "")}', total_norm.item(), self.step_itr)
+            for k, v in extra_scalar_metrics.items():
+                self.writer.add_scalar(prefix + k, v, self.step_itr)
+            self.writer.add_scalar(prefix + 'TimeComputingMetrics', time_computing_metrics[0], self.step_itr)
+            self.writer.add_scalar(prefix + 'TimeTraining', time_training[0], self.step_itr)
 
-                def _record_histogram(key, val):
-                    utils.get_tabular('plot').record(key, Histogram(val))
+            path_lengths = [
+                len(path['actions'])
+                for path in paths
+            ]
+            self.writer.add_scalar(prefix + 'PathLengthMean', np.mean(path_lengths), self.step_itr)
+            self.writer.add_scalar(prefix + 'PathLengthMax', np.max(path_lengths), self.step_itr)
+            self.writer.add_scalar(prefix + 'PathLengthMin', np.min(path_lengths), self.step_itr)
 
-                for k in metrics.keys():
-                    if metrics[k].numel() == 1:
-                        _record_scalar(f'{k}', metrics[k].item())
-                    else:
-                        _record_scalar(f'{k}', np.array2string(metrics[k].detach().cpu().numpy(), suppress_small=True))
-                with torch.no_grad():
-                    total_norm = compute_total_norm(self.all_parameters())
-                    _record_scalar('TotalGradNormAll', total_norm.item())
-                    for key, module in self.param_modules.items():
-                        total_norm = compute_total_norm(module.parameters())
-                        _record_scalar(f'TotalGradNorm{key.replace("_", " ").title().replace(" ", "")}', total_norm.item())
-                for k, v in extra_scalar_metrics.items():
-                    _record_scalar(k, v)
-                _record_scalar('TimeComputingMetrics', time_computing_metrics[0])
-                _record_scalar('TimeTraining', time_training[0])
-
-                path_lengths = [
-                    len(path['actions'])
-                    for path in paths
-                ]
-                _record_scalar('PathLengthMean', np.mean(path_lengths))
-                _record_scalar('PathLengthMax', np.max(path_lengths))
-                _record_scalar('PathLengthMin', np.min(path_lengths))
-
-                _record_histogram('ExternalDiscountedReturns', np.asarray(discounted_returns))
-                _record_histogram('ExternalUndiscountedReturns', np.asarray(undiscounted_returns))
+            self.writer.add_histogram(prefix + 'ExternalDiscountedReturns', np.asarray(discounted_returns), self.step_itr)
+            self.writer.add_histogram(prefix + 'ExternalUndiscountedReturns', np.asarray(undiscounted_returns), self.step_itr)
 
         return np.mean(undiscounted_returns)
 
@@ -947,31 +943,14 @@ class DRQ_METRAAgent:
         text_log_file = os.path.join(log_dir, 'debug.log')
         tb_dir = os.path.join(log_dir, 'tb')
 
-        tabular_log_file_eval = os.path.join(log_dir, 'progress_eval.csv')
-        text_log_file_eval = os.path.join(log_dir, 'debug_eval.log')
-        tb_dir_eval = os.path.join(log_dir, 'tb_eval')
-        tb_dir_plot = os.path.join(log_dir, 'tb_plot')
+        self.writer = SummaryWriter(tb_dir)
 
-        logger.add_output(dowel.TextOutput(text_log_file))
-        logger.add_output(dowel.CsvOutput(tabular_log_file))
-        logger.add_output(
-            dowel.TensorBoardOutput(tb_dir, x_axis='TotalEpoch'))
-        logger.add_output(dowel.StdOutput())
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger('DRQ_METRAAgent')
+        handler = logging.FileHandler(text_log_file)
+        self.logger.addHandler(handler)
 
-        dowel_eval = utils.get_dowel('eval')
-        logger_eval = dowel_eval.logger
-        logger_eval.add_output(dowel_eval.TextOutput(text_log_file_eval))
-        logger_eval.add_output(dowel_eval.CsvOutput(tabular_log_file_eval))
-        logger_eval.add_output(
-            dowel_eval.TensorBoardOutput(tb_dir_eval, x_axis='TotalEpoch'))
-        logger_eval.add_output(dowel_eval.StdOutput())
-
-        dowel_plot = utils.get_dowel('plot')
-        logger_plot = dowel_plot.logger
-        logger_plot.add_output(
-            dowel_plot.TensorBoardOutput(tb_dir_plot, x_axis='TotalEpoch'))
-
-        logger.log('Logging to {}'.format(log_dir))
+        print('Logging to {}'.format(log_dir))
 
     def _evaluate_policy(self):
         if self.discrete:
@@ -1004,7 +983,7 @@ class DRQ_METRAAgent:
         )
 
         if False: # TODO:
-            with utils.FigManager(self.snapshot_dir, self.step_itr, 'TrajPlot_RandomZ') as fm:
+            with utils.FigManager(self.snapshot_dir, self.step_itr, 'TrajPlot_RandomZ', writer=self.writer, global_step=self.step_itr) as fm:
                 self._env.render_trajectories(
                     random_trajectories, random_skill_colors, self.eval_plot_axis, fm.ax
                 )
@@ -1022,7 +1001,7 @@ class DRQ_METRAAgent:
 
         skill_colors = random_skill_colors
 
-        with utils.FigManager(self.snapshot_dir, self.step_itr, f'PhiPlot') as fm: # PhiPlot just plots ϕ(s). The phi trajectories in the paper are also ϕ(s) trajectories from randomly sampled z's.
+        with utils.FigManager(self.snapshot_dir, self.step_itr, f'PhiPlot', writer=self.writer, global_step=self.step_itr) as fm: # PhiPlot just plots ϕ(s). The phi trajectories in the paper are also ϕ(s) trajectories from randomly sampled z's.
             utils.draw_2d_gaussians(skill_means, skill_stddevs, skill_colors, fm.ax)
             utils.draw_2d_gaussians(
                 skill_samples,
@@ -1064,12 +1043,17 @@ class DRQ_METRAAgent:
 
         eval_skill_metrics.update(self.calc_eval_metrics(random_trajectories, is_skill_trajectories=True))
         with utils.GlobalContext({'phase': 'eval', 'policy': 'skill'}):
-            utils.log_performance_ex(
+            performance = utils.log_performance_ex(
                 self.step_itr,
                 TrajectoryBatch.from_trajectory_list(self._env_spec, random_trajectories),
                 discount=self.discount,
                 additional_records=eval_skill_metrics,
             )
+            # Log performance metrics with 'eval/' prefix
+            for k, v in performance['scalars'].items():
+                self.writer.add_scalar('eval/' + k, v, self.step_itr)
+            for k, v in performance['histograms'].items():
+                self.writer.add_histogram('eval/' + k, v, self.step_itr)
         self._log_eval_metrics()
 
     def calc_eval_metrics(self, trajectories, is_skill_trajectories=True):
@@ -1083,14 +1067,14 @@ class DRQ_METRAAgent:
     
     def log_diagnostics(self, pause_for_plot=False):
         total_time = (time.time() - self._start_time)
-        logger.log('Time %.2f s' % total_time)
+        self.logger.info('Time %.2f s' % total_time)
         epoch_time = (time.time() - self._itr_start_time)
-        logger.log('EpochTime %.2f s' % epoch_time)
-        tabular.record('TotalEnvSteps', self.total_env_steps)
-        tabular.record('TotalEpoch', self.total_epoch)
-        tabular.record('TimeEpoch', epoch_time)
-        tabular.record('TimeTotal', total_time)
-        logger.log(tabular)
+        self.logger.info('EpochTime %.2f s' % epoch_time)
+        self.writer.add_scalar('TotalEnvSteps', self.total_env_steps, self.total_epoch)
+        self.writer.add_scalar('TotalEpoch', self.total_epoch, self.total_epoch)
+        self.writer.add_scalar('TimeEpoch', epoch_time, self.total_epoch)
+        self.writer.add_scalar('TimeTotal', total_time, self.total_epoch)
+        self.writer.flush()
 
     def _log_eval_metrics(self):
         self.eval_log_diagnostics()
@@ -1098,19 +1082,15 @@ class DRQ_METRAAgent:
 
     def eval_log_diagnostics(self):
         total_time = (time.time() - self._start_time)
-        utils.get_tabular('eval').record('TotalEnvSteps', self.total_env_steps)
-        utils.get_tabular('eval').record('TotalEpoch', self.total_epoch)
-        utils.get_tabular('eval').record('TimeTotal', total_time)
-        utils.get_logger('eval').log(utils.get_tabular('eval'))
-        utils.get_logger('eval').dump_all(self.step_itr)
-        utils.get_tabular('eval').clear()
+        self.writer.add_scalar('eval/TotalEnvSteps', self.total_env_steps, self.step_itr)
+        self.writer.add_scalar('eval/TotalEpoch', self.total_epoch, self.step_itr)
+        self.writer.add_scalar('eval/TimeTotal', total_time, self.step_itr)
+        self.writer.flush()
 
     def plot_log_diagnostics(self):
-        utils.get_tabular('plot').record('TotalEnvSteps', self.total_env_steps)
-        utils.get_tabular('plot').record('TotalEpoch', self.total_epoch)
-        utils.get_logger('plot').log(utils.get_tabular('plot'))
-        utils.get_logger('plot').dump_all(self.step_itr)
-        utils.get_tabular('plot').clear()
+        self.writer.add_scalar('plot/TotalEnvSteps', self.total_env_steps, self.step_itr)
+        self.writer.add_scalar('plot/TotalEpoch', self.total_epoch, self.step_itr)
+        self.writer.flush()
 
     #########################################################################################################
     #                                                                                                       #
@@ -1128,7 +1108,7 @@ class DRQ_METRAAgent:
 
         """
 
-        logger.log('Saving snapshot...')
+        self.logger.info('Saving snapshot...')
 
         if new_save and epoch != 0:
             os.makedirs(os.path.join(self.snapshot_dir, f'models/epoch-{epoch}'), exist_ok=True)
@@ -1154,4 +1134,4 @@ class DRQ_METRAAgent:
                 'policy': self.skill_policy,
             }, file_name)
 
-        logger.log('Saved')
+        self.logger.info('Saved')
